@@ -228,6 +228,30 @@
     "type": "text",
     "default": "zm_qqgroupmgr插件有新的版本可更新!\nhttps://cloud.astrbot.app/plugin/ZomebieMask/astrbot_plugin_zm_qqgroupmgr"
   },
+  "report_remind_enabled": {
+    "description": "是否定时提醒未解决的问题报告",
+    "hint": "开启后每隔 report_remind_minutes 分钟，在还有未解决 /report 的群里列出全部未解决问题的编号、内容与报告人 QQ",
+    "type": "bool",
+    "default": true
+  },
+  "report_remind_minutes": {
+    "description": "提醒间隔（分钟）",
+    "hint": "默认 60 分钟。没有未解决问题的群不会收到提醒",
+    "type": "int",
+    "default": 60
+  },
+  "report_remind_at": {
+    "description": "提醒时是否 @ 群管理",
+    "hint": "关闭则只发列表、不 @ 任何人",
+    "type": "bool",
+    "default": true
+  },
+  "report_remind_users": {
+    "description": "提醒时 @ 的 QQ 号",
+    "hint": "每行一个。留空则 @ 本群全部群主和管理员；填了就只 @ 其中在本群的人，一个都不在本群时退回 @ 全部群管理",
+    "type": "list",
+    "default": []
+  },
   "media_wait_timeout": {
     "description": "两步指令等待图片 / 答复的超时时间（秒）",
     "hint": "/g pp、/bc、/bye image 提示「请发送图片」之后的等待时长，超时即指令失效。默认 60 秒",

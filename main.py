@@ -43,6 +43,14 @@ from .core.joinapproval import (
 from .core.mutes import MuteTracker, chunk_duration
 from .core.onebot import OneBotApi, forward_node, resolve_member_name
 from .core.pending import PendingRegistry, session_key
+from .core.reports import (
+    MAX_OPEN_PER_USER,
+    MAX_REPORT_LEN,
+    ReportBook,
+    digest_text,
+    remind_targets,
+    status_text,
+)
 from .core.sensitive import (
     MODE_BOTH,
     MODE_CUSTOM,
@@ -57,6 +65,7 @@ from .core.store import (
     JsonStore,
     backup_on_upgrade,
     coerce_int,
+    coerce_str_list,
     get_data_dir,
 )
 from .core.utils import (
@@ -75,7 +84,7 @@ from .core.utils import (
 )
 
 PLUGIN_NAME = "ZM-QQGroupmgr"
-PLUGIN_VERSION = "1.0.6"
+PLUGIN_VERSION = "1.0.7"
 
 # 版本检查与更新提示指向的仓库
 PLUGIN_REPO = "ZomebieMask/astrbot_plugin_zm_qqgroupmgr"
@@ -251,11 +260,13 @@ class ZMQQGroupmgr(Star):
         self.words_store = JsonStore("sensitive_words.json")
         self.mutes_store = JsonStore("mutes.json")
         self.files_store = JsonStore("files.json")
+        self.reports_store = JsonStore("reports.json")
 
         self.sensitive = SensitiveWordEngine(self.words_store, self.config)
         self.mutes = MuteTracker(self.mutes_store)
         self.files = FileRepository(self.files_store, self.config)
         self.cards = CardCache()
+        self.reports = ReportBook(self.reports_store)
 
         self.flood = FloodDetector(
             threshold=coerce_int(self.config.get("flood_threshold"), 5),
@@ -337,7 +348,9 @@ class ZMQQGroupmgr(Star):
         if self.server is not None:
             await self.server.stop()
             self.server = None
-        for store in (self.settings, self.words_store, self.mutes_store, self.files_store):
+        for store in (
+            self.settings, self.words_store, self.mutes_store, self.files_store, self.reports_store
+        ):
             await store.save()
         logger.info("[ZM-QQGroupmgr] 插件已卸载")
 
@@ -590,7 +603,7 @@ class ZMQQGroupmgr(Star):
         return max(1, min(value, MAX_POLL_MINUTES))
 
     async def _ticker(self) -> None:
-        """一个循环干三件事，省掉三套定时器。
+        """一个循环干四件事，省掉四套定时器。
 
         ponytail: 60 秒粒度的轮询，够用；要秒级精度再改成每条记录一个定时器。
         """
@@ -600,6 +613,7 @@ class ZMQQGroupmgr(Star):
                 await self._renew_long_mutes()
                 await self._refresh_dynamic_answers()
                 await self._check_update()
+                await self._remind_reports()
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # 单次异常不能让整个循环停掉
@@ -730,6 +744,44 @@ class ZMQQGroupmgr(Star):
         meta["update_notified"] = latest
         await self.settings.save()
         logger.info(f"[ZM-QQGroupmgr] 发现新版本 v{latest}，已在 {sent} 个群提示")
+
+    async def _remind_reports(self) -> None:
+        """每 report_remind_minutes 分钟，在还有未解决报告的群里列一遍。"""
+        if not self.config.get("report_remind_enabled", True):
+            return
+        minutes = max(1, coerce_int(self.config.get("report_remind_minutes"), 60))
+        meta = self._meta()
+        now = int(time.time())
+        if now - int(meta.get("report_reminded_at") or 0) < minutes * 60:
+            return
+        api = self._bg_api()
+        if api is None:
+            return
+        meta["report_reminded_at"] = now
+        await self.settings.save()
+
+        at_admins = self.config.get("report_remind_at", True)
+        configured = coerce_str_list(self.config.get("report_remind_users"))
+        bot_id = ""
+        if at_admins:
+            login = await api.try_call("get_login_info") or {}
+            bot_id = str(login.get("user_id") or "")
+
+        # 机器人已经退出的群跳过，不然那里的未解决报告会每轮发送失败刷一次日志
+        joined = {str(item.get("group_id")) for item in await api.group_list()}
+        for group_id in self.reports.groups_with_open():
+            if joined and group_id not in joined:
+                continue
+            # 用消息段而不是 CQ 字符串：报告内容是成员写的，拼进字符串就得逐个转义
+            segments = []
+            if at_admins:
+                members = await api.member_list(int(group_id))
+                for uid in remind_targets(members, configured, bot_id):
+                    segments.append({"type": "at", "data": {"qq": uid}})
+            text = digest_text(self.reports, group_id)
+            segments.append({"type": "text", "data": {"text": ("\n" if segments else "") + text}})
+            await api.send_group_msg(int(group_id), segments)
+            await asyncio.sleep(BATCH_INTERVAL)
 
     def _update_notify_enabled(self, group_id: str) -> bool:
         """/update 开关，默认开启。"""
@@ -2684,21 +2736,18 @@ class ZMQQGroupmgr(Star):
             return
 
         # 优先处理引用回复
-        for component in event.message_obj.message or []:
-            if type(component).__name__ == "Reply":
-                target_id = getattr(component, "id", None)
-                if target_id is None:
-                    continue
-                ok, error = await api.recall_detail(target_id)
-                if not ok:
-                    yield event.plain_result(
-                        f"撤回失败: {error or '协议端未返回原因'}"
-                        "（消息可能已被撤回，或机器人权限不足）"
-                    )
-                    return
-                # 顺带撤回 /recall 指令本身
-                await api.try_call("delete_msg", message_id=event.message_obj.message_id)
+        target_id = self._reply_id(event)
+        if target_id is not None:
+            ok, error = await api.recall_detail(target_id)
+            if not ok:
+                yield event.plain_result(
+                    f"撤回失败: {error or '协议端未返回原因'}"
+                    "（消息可能已被撤回，或机器人权限不足）"
+                )
                 return
+            # 顺带撤回 /recall 指令本身
+            await api.try_call("delete_msg", message_id=event.message_obj.message_id)
+            return
 
         args = self._args(event, "recall")
         if not args:
@@ -3653,6 +3702,156 @@ class ZMQQGroupmgr(Star):
             await api.send_group_msg(int(group_id), message)
 
     # ------------------------------------------------------------------
+    # 群精华
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reply_id(event: AstrMessageEvent):
+        """被引用（回复）的那条消息的 id，没引用返回 None。"""
+        for component in event.message_obj.message or []:
+            if type(component).__name__ == "Reply":
+                target_id = getattr(component, "id", None)
+                if target_id is not None:
+                    return target_id
+        return None
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("star")
+    async def cmd_star(self, event: AstrMessageEvent):
+        """/star - 把引用的消息设为群精华"""
+        async for result in self._toggle_essence(event, "star", True):
+            yield result
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("remove_star", alias={"rs"})
+    async def cmd_remove_star(self, event: AstrMessageEvent):
+        """/remove_star - 取消引用消息的群精华（缩写 /rs）"""
+        async for result in self._toggle_essence(event, "remove_star", False):
+            yield result
+
+    async def _toggle_essence(self, event: AstrMessageEvent, command: str, enable: bool):
+        if not self._require_group(event):
+            yield event.plain_result(ADMIN_ONLY)
+            return
+
+        api = OneBotApi(event)
+        if not api.available:
+            yield event.plain_result(QQ_ONLY)
+            return
+
+        message_id = self._reply_id(event)
+        if message_id is None:
+            yield event.plain_result(f"用法: 引用（回复）一条消息后发送 /{command}")
+            return
+
+        verb = "设为" if enable else "取消"
+        try:
+            await api.call(
+                "set_essence_msg" if enable else "delete_essence_msg", message_id=message_id
+            )
+        except RuntimeError as exc:
+            yield event.plain_result(f"{verb}群精华失败: {exc}（机器人需为群主或管理员）")
+            return
+        yield event.plain_result("已设为群精华" if enable else "已取消群精华")
+
+    # ------------------------------------------------------------------
+    # 问题反馈：/report 排队、/solve 处理、/check_report 查进度
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quote(event: AstrMessageEvent, text: str):
+        """引用发指令的那条消息来回复。"""
+        import astrbot.api.message_components as Comp
+
+        return event.chain_result(
+            [Comp.Reply(id=event.message_obj.message_id), Comp.Plain(text)]
+        )
+
+    @filter.command("report")
+    async def cmd_report(self, event: AstrMessageEvent):
+        """/report <内容> - 提交问题反馈，自动排队编号（全体成员可用）"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+
+        content = self._raw_after(event, "report")
+        if not content:
+            yield event.plain_result("用法: /report <问题内容>\n例: /report 下载链接打不开")
+            return
+        if len(content) > MAX_REPORT_LEN:
+            yield event.plain_result(
+                f"报告内容最长 {MAX_REPORT_LEN} 字，当前 {len(content)} 字，请精简后再提交"
+            )
+            return
+
+        user_id = str(event.get_sender_id())
+        waiting = [r for r in self.reports.user_reports(group_id, user_id) if not r.get("solved")]
+        if len(waiting) >= MAX_OPEN_PER_USER:
+            yield event.plain_result(
+                f"您已有 {len(waiting)} 个报告尚未解决，请等处理后再提交（发送 /cr 查看进度）"
+            )
+            return
+
+        report, ahead = await self.reports.add(group_id, user_id, content)
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(report["time"]))
+        yield self._quote(
+            event,
+            f"报告已收到，报告编号为 {report['no']}\n"
+            f"提交时间: {when}\n"
+            f"前方还有 {ahead} 个问题等待解决，发送 /cr 可随时查看进度",
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("solve")
+    async def cmd_solve(self, event: AstrMessageEvent):
+        """/solve <编号> <回复> - 解决报告并回复报告人；不带参数列出未解决报告"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+
+        parts = self._raw_after(event, "solve").split(None, 1)
+        number = parts[0].lstrip("#＃") if parts else ""
+        if not number.isdecimal() or len(parts) < 2:
+            yield event.plain_result(
+                digest_text(self.reports, group_id) + "\n\n用法: /solve <编号> <回复内容>"
+            )
+            return
+
+        reply = parts[1].strip()
+        if len(reply) > MAX_REPORT_LEN:
+            yield event.plain_result(f"回复最长 {MAX_REPORT_LEN} 字，当前 {len(reply)} 字")
+            return
+
+        report = await self.reports.solve(group_id, int(number), reply, event.get_sender_id())
+        if report is None:
+            yield event.plain_result(
+                f"没有编号为 {number} 的未解决报告\n\n" + digest_text(self.reports, group_id)
+            )
+            return
+
+        import astrbot.api.message_components as Comp
+
+        yield event.chain_result(
+            [
+                Comp.At(qq=report["user_id"]),
+                Comp.Plain(
+                    f" 您的报告（编号 {report['no']}）已解决\n管理员回复：{report['reply']}"
+                ),
+            ]
+        )
+
+    @filter.command("check_report", alias={"cr"})
+    async def cmd_check_report(self, event: AstrMessageEvent):
+        """/check_report - 查看自己报告的处理进度（缩写 /cr，全体成员可用）"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        yield self._quote(event, status_text(self.reports, group_id, str(event.get_sender_id())))
+
+    # ------------------------------------------------------------------
     # 帮助
     # ------------------------------------------------------------------
 
@@ -3753,11 +3952,18 @@ class ZMQQGroupmgr(Star):
             "【消息与迎送】\n"
             "/recall                 回复消息后撤回\n"
             "/recall <数量> [是否包含机器人]  批量撤回（例: /recall 5 false）\n"
+            "/star                   引用消息后设为群精华\n"
+            "/remove_star            引用消息后取消群精华（缩写 /rs）\n"
             "/ad | /ad set <文本> | /ad clear | /ad reset\n"
             "/adban on|off           广告拦截\n"
             "/wel set <文本> | on | off | reset | status    入群欢迎\n"
             "/bye set <文本> | image | image clear | on | off | reset | status\n"
             "                        退群提示，可附图片\n\n"
+            "【问题反馈】\n"
+            "/report <内容>           提交问题，自动排队编号（全体可用）\n"
+            "/check_report           查看自己报告的进度和历史（缩写 /cr，全体可用）\n"
+            "/solve <编号> <回复>     标记解决并回复报告人；不带参数列出未解决的\n"
+            "  未解决的报告每 report_remind_minutes 分钟在群里提醒一次\n\n"
             "【其他】\n"
             "/merge <标题> <qq> <内容> [...]  构造合并转发，标题即卡片名（全体可用）\n"
             "/kill <成员> <理由>              赛博击杀播报\n"

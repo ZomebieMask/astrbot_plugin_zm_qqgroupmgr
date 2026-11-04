@@ -390,6 +390,89 @@ def test_long_mute():
     print("  长禁言: 分段下发 / 续期时间 / 到期停续 OK")
 
 
+def test_reports():
+    """/report 编号、/solve、/cr 文案、提醒 @ 谁。"""
+    import asyncio
+
+    rp = sys.modules["zmplugin.core.reports"]
+
+    class FakeStore:
+        def __init__(self):
+            self.data = {}
+
+        def get(self, key, default=None):
+            return self.data.get(key, default)
+
+        def group(self, gid):
+            return self.data.setdefault(gid, {})
+
+        def keys(self):
+            return self.data.keys()
+
+        async def save(self):
+            pass
+
+    book = rp.ReportBook(FakeStore())
+    add = lambda uid, text: asyncio.run(book.add("100", uid, text))
+    solve = lambda no, reply: asyncio.run(book.solve("100", no, reply, "9"))
+
+    assert book.groups_with_open() == []
+    r1, ahead = add("11", "第一个")
+    assert (r1["no"], ahead) == (1, 0), "前方 0 个就是 1 号"
+    r2, _ = add("22", "第二个")
+    r3, ahead = add("33", "第三个")
+    assert (r2["no"], r3["no"], ahead) == (2, 3, 2)
+
+    # 按顺序处理掉 1 号后，前方只剩 2 个，算出来是 3，但 3 还没解决 → 顺延到 4
+    assert solve(1, "好了")["reply"] == "好了"
+    r4, ahead = add("44", "第四个")
+    assert (r4["no"], ahead) == (4, 2), (r4["no"], ahead)
+    open_nos = [r["no"] for r in book.open_reports("100")]
+    assert len(open_nos) == len(set(open_nos)), "未解决的编号不能重复"
+
+    assert solve(1, "再来") is None, "已解决的不能再解决一次"
+    assert solve(99, "x") is None
+    assert book.ahead("100", r4) == 2
+    assert solve(2, "ok") and book.ahead("100", r4) == 1
+    assert book.groups_with_open() == ["100"]
+
+    # 都处理完以后号从 1 重新排
+    solve(3, "ok"), solve(4, "ok")
+    r5, ahead = add("11", "又来了")
+    assert (r5["no"], ahead) == (1, 0)
+
+    text = rp.status_text(book, "100", "11")
+    assert text.startswith("您最近的报告信息为又来了 报告编号为1\n"), text
+    assert "尚未得到解决 前方还有 0 个问题" in text
+    assert "1  |  第一个  |  已解决  |  回复的内容↓\n好了" in text, text
+    assert "1  |  又来了  |  未解决" in text
+    assert "得到了解决" in rp.status_text(book, "100", "44")
+    assert "还没有提交过" in rp.status_text(book, "100", "999")
+
+    # 手改过的 reports.json：编号是字符串、时间不是数字，都不能把提醒和 /solve 弄崩
+    book.store.data["100"]["reports"].append(
+        {"no": "7", "user_id": "55", "content": "手改的", "time": "昨天", "solved": False}
+    )
+    assert "手改的" in rp.digest_text(book, "100")
+    assert solve(7, "认得") is not None, "字符串编号也要能解决"
+
+    digest = rp.digest_text(book, "100")
+    assert "还有 1 个问题未解决" in digest and "QQ:11" in digest and "又来了" in digest
+    assert rp.digest_text(book, "200") == "本群目前没有未解决的问题"
+
+    members = [
+        {"user_id": 1, "role": "owner"},
+        {"user_id": 2, "role": "admin"},
+        {"user_id": 3, "role": "member"},
+        {"user_id": 8, "role": "admin"},
+    ]
+    assert rp.remind_targets(members, [], "8") == ["1", "2"], "默认 @ 群主 + 管理，不 @ 机器人"
+    assert rp.remind_targets(members, ["3"], "8") == ["3"], "填了就只 @ 填的人"
+    assert rp.remind_targets(members, ["777"], "8") == ["1", "2"], "填的人不在本群，退回群管理"
+    assert rp.remind_targets([], ["777"], "8") == ["777"], "拿不到成员列表时照填写的 @"
+    print("  问题反馈: 编号顺延 / 解决 / 排队数 / /cr 文案 / 提醒对象 OK")
+
+
 if __name__ == "__main__":
     _stub_astrbot()
     main = _load_plugin()
@@ -401,4 +484,5 @@ if __name__ == "__main__":
     test_sha_retry_kick(main)
     test_mute_args()
     test_long_mute()
+    test_reports()
     print(f"全部自检通过 —— {main.PLUGIN_NAME} v{main.PLUGIN_VERSION}")

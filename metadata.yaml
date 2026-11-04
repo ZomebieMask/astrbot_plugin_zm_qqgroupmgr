@@ -1,11 +1,11 @@
 name: astrbot_plugin_zm_qqgroupmgr
 display_name: ZM-QQGroupmgr
-version: 1.0.6
+version: 1.0.7
 author: ZM
 desc: |
   一款多功能QQ群管插件 你值得安装  :)
 
-  禁言 · 踢人封禁 · 敏感词 · 刷屏检测 · 广告拦截 · 进群审批 · 文件分发 · 群公告迎送 · 跨群批量
+  禁言 · 踢人封禁 · 敏感词 · 刷屏检测 · 广告拦截 · 进群审批 · 问题反馈 · 群精华 · 文件分发 · 群公告迎送 · 跨群批量
 
   安装后发送 `/zmhelp` 查看全部指令。完整文档见 [GitHub 仓库](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr)。
 short_desc: 一款多功能QQ群管插件 你值得安装 :)
@@ -21,4 +21,5 @@ tags:
   - QQ群
   - 广告拦截
   - 进群审批
+  - 问题反馈
 

@@ -6,9 +6,9 @@
 
 ### 一个插件，顶十个 —— AstrBot 全能 QQ 群管理套件
 
-**28 组指令 · 11 大模块 · 从禁言踢人到进群审批、敏感词、刷屏、广告、文件分发、跨群批量操作，一站装完**
+**33 组指令 · 12 大模块 · 从禁言踢人到进群审批、问题反馈、敏感词、刷屏、广告、文件分发、跨群批量操作，一站装完**
 
-[![version](https://img.shields.io/badge/version-1.0.6-blue?style=flat-square)](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr/releases)
+[![version](https://img.shields.io/badge/version-1.0.7-blue?style=flat-square)](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr/releases)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A53.4.0-7B68EE?style=flat-square)](https://astrbot.app)
 [![platform](https://img.shields.io/badge/platform-aiocqhttp%20%7C%20nakuru-32CD32?style=flat-square)](https://docs.astrbot.app)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr/blob/main/LICENSE)
@@ -30,7 +30,8 @@
 | 模块 | 能力 | 核心指令 |
 | :--- | :--- | :--- |
 | 🔨 **成员管理** | 禁言（**最长 3650 天**，自动分段续期）/ 解禁 / 全体禁言 / 禁言列表与剩余时长 / 踢人 / 按不活跃天数清理 / 封禁并自动拒绝加群 / 收放管理员 | `/mute` `/muteall` `/mutelist` `/kick` `/ban` `/op` |
-| 💬 **消息管理** | 回复即撤 / 批量撤回最近 N 条 / 从协议端拉群历史（连机器人自己和插件启动前的消息也能撤） | `/recall` |
+| 💬 **消息管理** | 回复即撤 / 批量撤回最近 N 条 / 从协议端拉群历史（连机器人自己和插件启动前的消息也能撤）/ 引用即设群精华 | `/recall` `/star` `/rs` |
+| 📮 **问题反馈** | 成员排队提交问题，自动编号；管理员按编号处理并回复；成员随时查进度和历史；未解决的定时提醒并 @ 群管理 | `/report` `/solve` `/cr` |
 | 🚫 **敏感词** | 命中即撤回 + 禁言，时长按群独立设置；自定义词 / 远程词库 / 混合三种词源；白名单纠偏 | `/sw` |
 | 🌊 **刷屏检测** | 滑动窗口条数 + 连续重复内容双重判定，阈值可调，按群开关 | `/antiflood` |
 | 🏷️ **名片检测** | 扫群名片里的广告与敏感内容，处理方式可选 warn / reset / mute / kick | `/cardcheck` |
@@ -143,7 +144,7 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 
 ## 📖 指令手册
 
-> 🔒 管理类指令仅 **AstrBot 管理员** 可用。对全体群成员开放的只有 `/file download`、`/file list`、`/file log`（查看）、`/merge` 和 `/slimefinder`。
+> 🔒 管理类指令仅 **AstrBot 管理员** 可用。对全体群成员开放的只有 `/file download`、`/file list`、`/file log`（查看）、`/merge`、`/slimefinder`、`/report` 和 `/check_report`。
 > ⏱️ 时长单位：`s` 秒 · `m` 分 · `h` 时 · `d` 天 · `w` 周。
 
 <details open>
@@ -177,12 +178,14 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 </details>
 
 <details>
-<summary><b>💬 消息撤回</b></summary>
+<summary><b>💬 消息撤回 · 群精华</b></summary>
 
 | 指令 | 说明 |
 | :--- | :--- |
 | `/recall` | 回复某条消息后使用，撤回被回复的那条 |
 | `/recall <数量> [是否含机器人]` | 撤回最近 N 条，第二参数填 `false` 则跳过机器人自己的消息 |
+| `/star` | 引用（回复）某条消息后使用，把它设为群精华 |
+| `/remove_star`（`/rs`） | 引用某条消息后使用，取消它的群精华 |
 
 ```
 /recall 20               撤回最近 20 条
@@ -381,6 +384,44 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 </details>
 
 <details>
+<summary><b>📮 问题反馈</b></summary>
+
+| 指令 | 说明 |
+| :--- | :--- |
+| `/report <内容>` | 提交问题，自动给编号。**全体成员可用** |
+| `/check_report`（`/cr`） | 查看自己最近一次报告的进度和历史报告。**全体成员可用** |
+| `/solve <编号> <回复>` | 把该编号标记为已解决，并 @ 报告人附上回复；不带参数时列出全部未解决问题 |
+
+```
+/report 下载链接打不开          → 报告已收到，报告编号为 3，前方还有 2 个问题等待解决
+/solve 3 已经修好了，重新下载即可  → @报告人 您的报告（编号 3）已解决
+/cr                             → 查进度和历史
+```
+
+`/cr` 的回复（引用你的那条消息）：
+
+```
+您最近的报告信息为下载链接打不开 报告编号为3
+您的问题尚未得到解决 前方还有 2 个问题等待解决 请您耐心等待 感谢配合！
+您的历史报告内容为：
+1  |  群文件里的整合包缺 mod  |  已解决  |  回复的内容↓
+已经补上了
+3  |  下载链接打不开  |  未解决
+```
+
+**编号规则**：编号 = 提交时前方未解决的问题数 + 1，前方没有就是 1 号。管理员没按顺序处理时这个号可能还被别的未解决问题占着，那就往后顺延到空号——**未解决的问题之间编号绝不重复**，`/solve` 不会认错人。问题全部处理完以后，编号重新从 1 开始。
+
+- 内容和 `/solve` 的回复都最长 200 字；同一个人最多同时挂 3 个未解决的报告，防止刷队列
+- 一条消息装不下太多：定时提醒最多列 10 条，`/cr` 显示最近 5 条历史
+- 报告按群分开排队，存在 `reports.json`，重启不丢
+- **定时提醒**：每 `report_remind_minutes` 分钟（默认 60）在还有未解决问题的群里列一遍，每条带编号、报告人 QQ、提交时间和内容。没有未解决问题的群不提醒
+  - `report_remind_enabled` 开关提醒，默认开
+  - `report_remind_at` 提醒时是否 @ 群管理，默认开
+  - `report_remind_users` 填了 QQ 号就只 @ 这些人（不在本群的自动跳过）；留空则 @ 本群群主和全部管理员
+
+</details>
+
+<details>
 <summary><b>🎮 趣味工具</b></summary>
 
 | 指令 | 说明 |
@@ -433,6 +474,7 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 | ☠️ 赛博击杀 | `kill_template` `kill_notify_all_groups` |
 | 🖼️ 图片交互 | `media_wait_timeout`（等待补发图片/答复秒数，默认 60）`avatar_recall` `broadcast_recall` `farewell_recall`（均默认开启） |
 | 🚪 进群审批 | `join_verify_minutes` `join_code_digits` `join_sha_poll_minutes`(默认 30 分钟) `join_question_text` `join_verify_tip` `join_sha_tip` `join_pass_tip` `join_timeout_tip` `join_decline_tip` |
+| 📮 问题反馈 | `report_remind_enabled`（默认开）`report_remind_minutes`（默认 60）`report_remind_at`（默认开）`report_remind_users`（留空 = 全体群管理） |
 | 🔔 更新通知 | `update_check_days` `update_tip` |
 | 📜 帮助菜单 | `help_menu_text` —— 留空用内置完整菜单；填写后 `/zmhelp` 只显示你写的内容，支持 `{name}` `{version}` `{cooldown}` 三个占位符 |
 
@@ -446,7 +488,7 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 
 | 权限 | 用途 |
 | :--- | :--- |
-| ✅ 群管理员 / 群主 | 禁言、踢人、撤回他人消息、改群资料 |
+| ✅ 群管理员 / 群主 | 禁言、踢人、撤回他人消息、改群资料、设置 / 取消群精华 |
 | ✅ 群主 | 设置管理员、设置群头衔 |
 
 ---
@@ -484,7 +526,7 @@ QQ 侧限制：群专属头衔通常**只有群主**能设置，机器人只是�
 <details>
 <summary><b>数据会丢吗？升级插件要重新配一遍吗？</b></summary>
 
-**不用。** 所有运行数据都存在插件目录之外的 `data/plugin_data/ZM-QQGroupmgr/`（封禁列表、各类文本、开关、自定义敏感词、文件仓库、更新日志），后台面板里的配置项由 AstrBot 存在 `data/config/` 下。覆盖安装、插件市场更新、`git pull` 都不会碰这两处，升级后原样继续用。
+**不用。** 所有运行数据都存在插件目录之外的 `data/plugin_data/ZM-QQGroupmgr/`（封禁列表、各类文本、开关、自定义敏感词、文件仓库、更新日志、问题报告），后台面板里的配置项由 AstrBot 存在 `data/config/` 下。覆盖安装、插件市场更新、`git pull` 都不会碰这两处，升级后原样继续用。
 
 额外保险：插件检测到版本号变化时，会先把数据目录里的 `*.json` 快照到 `data/plugin_data/ZM-QQGroupmgr/backups/<旧版本>-<时间戳>/`。真遇到新版本写坏老数据，把这个目录里的文件拷回上一层即可。
 
