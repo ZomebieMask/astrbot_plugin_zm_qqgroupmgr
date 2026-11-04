@@ -103,6 +103,7 @@ DEFAULT_MUTE_REASON = "管理员手动禁言"
 
 ADMIN_ONLY = "此命令仅群聊可用"
 QQ_ONLY = "此功能仅支持 QQ (aiocqhttp) 平台"
+REPORT_HANDLER_ONLY = "{command} 仅 AstrBot 管理员、群主、群管理员及插件配置 report_solve_users 中的成员可用"
 
 # /file 的写操作仅管理员可用；download/list/log 查看对全体成员开放。
 ADMIN_FILE_ACTIONS = {"upload", "delete", "del", "rm"}
@@ -3659,6 +3660,11 @@ class ZMQQGroupmgr(Star):
         if sub_type == "kick_me" or user_id == str(event.get_self_id() or ""):
             return
 
+        # 人已经不在群里，报告没法再回复，连同历史一起清掉
+        removed = await self.reports.remove_user(group_id, user_id)
+        if removed:
+            logger.info(f"[ZM-QQGroupmgr] {user_id} 已离开群 {group_id}，删除其 {removed} 条报告")
+
         state = self._farewell(group_id)
         if not state.get("enabled"):
             return
@@ -3802,13 +3808,32 @@ class ZMQQGroupmgr(Star):
             f"前方还有 {ahead} 个问题等待解决，发送 /cr 可随时查看进度",
         )
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def _can_handle_reports(self, event: AstrMessageEvent, group_id: str) -> bool:
+        """/solve、/drh 谁能用：AstrBot 管理员、本群群主和管理员、report_solve_users 里的 QQ。"""
+        if event.is_admin():
+            return True
+        user_id = str(event.get_sender_id())
+        if user_id in coerce_str_list(self.config.get("report_solve_users")):
+            return True
+        raw = getattr(event.message_obj, "raw_message", None)
+        sender = raw.get("sender") if isinstance(raw, dict) else None
+        role = sender.get("role") if isinstance(sender, dict) else None
+        # 消息里没带群身份时现查一次
+        if role is None and user_id.isdigit():
+            api = OneBotApi(event)
+            if api.available:
+                role = (await api.member_info(int(group_id), int(user_id))).get("role")
+        return role in ("owner", "admin")
+
     @filter.command("solve")
     async def cmd_solve(self, event: AstrMessageEvent):
         """/solve <编号> <回复> - 解决报告并回复报告人；不带参数列出未解决报告"""
         group_id = self._require_group(event)
         if not group_id:
             yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._can_handle_reports(event, group_id):
+            yield event.plain_result(REPORT_HANDLER_ONLY.format(command="/solve"))
             return
 
         parts = self._raw_after(event, "solve").split(None, 1)
@@ -3850,6 +3875,36 @@ class ZMQQGroupmgr(Star):
             yield event.plain_result(ADMIN_ONLY)
             return
         yield self._quote(event, status_text(self.reports, group_id, str(event.get_sender_id())))
+
+    @filter.command("drh")
+    async def cmd_delete_report_history(self, event: AstrMessageEvent):
+        """/drh <成员> - 删除成员在本群的全部报告记录，@ 或 QQ 号均可"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._can_handle_reports(event, group_id):
+            yield event.plain_result(REPORT_HANDLER_ONLY.format(command="/drh"))
+            return
+
+        # @机器人 唤醒时机器人自己也在 @ 列表里
+        bot_id = str(event.get_self_id() or "")
+        targets = [
+            uid for uid in extract_targets(event, self._raw_after(event, "drh")) if uid != bot_id
+        ]
+        if not targets:
+            yield event.plain_result("用法: /drh <成员>  @ 成员或直接写 QQ 号，可一次写多个")
+            return
+
+        lines = []
+        for user_id in targets:
+            removed = await self.reports.remove_user(group_id, user_id)
+            lines.append(
+                f"已删除 QQ:{user_id} 的 {removed} 条报告"
+                if removed
+                else f"QQ:{user_id} 在本群没有报告记录"
+            )
+        yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------
     # 帮助
@@ -3963,6 +4018,9 @@ class ZMQQGroupmgr(Star):
             "/report <内容>           提交问题，自动排队编号（全体可用）\n"
             "/check_report           查看自己报告的进度和历史（缩写 /cr，全体可用）\n"
             "/solve <编号> <回复>     标记解决并回复报告人；不带参数列出未解决的\n"
+            "/drh <成员>              删除该成员在本群的全部报告记录\n"
+            "  /solve、/drh 群主、群管理和 report_solve_users 里的成员也可用\n"
+            "  成员退群后，其报告记录自动删除\n"
             "  未解决的报告每 report_remind_minutes 分钟在群里提醒一次\n\n"
             "【其他】\n"
             "/merge <标题> <qq> <内容> [...]  构造合并转发，标题即卡片名（全体可用）\n"

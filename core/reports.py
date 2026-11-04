@@ -100,6 +100,24 @@ class ReportBook:
                 return item
         return None
 
+    async def remove_user(self, group_id: str, user_id: str) -> int:
+        """删掉某人在本群的全部报告（含未解决的），返回删了几条。"""
+        bucket = self.store.get(str(group_id))
+        items = bucket.get("reports") if isinstance(bucket, dict) else None
+        if not isinstance(items, list):
+            return 0
+        # 手改过的 reports.json 里 user_id 可能是数字，统一转字符串再比
+        kept = [
+            item
+            for item in items
+            if not (isinstance(item, dict) and str(item.get("user_id")) == str(user_id))
+        ]
+        removed = len(items) - len(kept)
+        if removed:
+            items[:] = kept
+            await self.store.save()
+        return removed
+
 
 def remind_targets(members: List[Dict[str, Any]], configured: List[str], bot_id: str) -> List[str]:
     """定时提醒要 @ 谁。

@@ -470,7 +470,63 @@ def test_reports():
     assert rp.remind_targets(members, ["3"], "8") == ["3"], "填了就只 @ 填的人"
     assert rp.remind_targets(members, ["777"], "8") == ["1", "2"], "填的人不在本群，退回群管理"
     assert rp.remind_targets([], ["777"], "8") == ["777"], "拿不到成员列表时照填写的 @"
-    print("  问题反馈: 编号顺延 / 解决 / 排队数 / /cr 文案 / 提醒对象 OK")
+
+    # 退群 / /drh：只删这个人的，别人的排队不受影响；手改成数字的 user_id 也要认
+    add("66", "要被删的"), add("66", "这条也是")
+    book.store.data["100"]["reports"].append({"no": 9, "user_id": 66, "solved": True})
+    before = len(book.store.data["100"]["reports"])
+    assert asyncio.run(book.remove_user("100", "66")) == 3
+    assert len(book.store.data["100"]["reports"]) == before - 3
+    assert book.user_reports("100", "66") == [] and book.user_reports("100", "11")
+    assert asyncio.run(book.remove_user("100", "66")) == 0
+    assert asyncio.run(book.remove_user("404", "66")) == 0, "没数据的群不该建出空桶"
+    assert "404" not in book.store.data
+    print("  问题反馈: 编号顺延 / 解决 / 排队数 / /cr 文案 / 提醒对象 / 删除记录 OK")
+
+
+def test_report_handlers(main):
+    """/solve、/drh：AstrBot 管理员、群主群管、report_solve_users 能用，普通成员不能。"""
+    import asyncio
+
+    class FakeEvent:
+        def __init__(self, uid, role=None, admin=False):
+            self.uid, self.admin = uid, admin
+            sender = {"user_id": int(uid)}
+            if role:
+                sender["role"] = role
+            self.message_obj = types.SimpleNamespace(raw_message={"sender": sender})
+
+        def is_admin(self):
+            return self.admin
+
+        def get_sender_id(self):
+            return self.uid
+
+        def get_platform_name(self):
+            return "aiocqhttp"
+
+    inst = object.__new__(main.ZMQQGroupmgr)
+    inst.config = {"report_solve_users": ["555"]}
+    can = lambda ev: asyncio.run(main.ZMQQGroupmgr._can_handle_reports(inst, ev, "100"))
+
+    assert can(FakeEvent("1", "member", admin=True))
+    assert can(FakeEvent("2", "owner")) and can(FakeEvent("3", "admin"))
+    assert can(FakeEvent("555", "member")), "配置里的 QQ 可用"
+    assert not can(FakeEvent("4", "member"))
+
+    # 消息里没带 role（部分协议端），现查群成员信息
+    asked = []
+
+    class FakeApi:
+        async def call_action(self, action, **kw):
+            asked.append(kw["user_id"])
+            return {"role": "admin" if kw["user_id"] == 6 else "member"}
+
+    ev6, ev7 = FakeEvent("6"), FakeEvent("7")
+    ev6.bot = ev7.bot = types.SimpleNamespace(api=FakeApi())
+    assert can(ev6) and not can(ev7)
+    assert asked == [6, 7], asked
+    print("  /solve /drh 权限: Bot 管理 / 群主群管 / 指定 QQ / 现查身份 OK")
 
 
 if __name__ == "__main__":
@@ -485,4 +541,5 @@ if __name__ == "__main__":
     test_mute_args()
     test_long_mute()
     test_reports()
+    test_report_handlers(main)
     print(f"全部自检通过 —— {main.PLUGIN_NAME} v{main.PLUGIN_VERSION}")
