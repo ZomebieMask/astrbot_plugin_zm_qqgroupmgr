@@ -15,6 +15,18 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from .core.detector import CardCache, FloodDetector, ad_score
+from .core.draws import (
+    DEFAULT_CLAIM_TIP,
+    MAX_DRAWS,
+    USAGE as DRAW_USAGE,
+    DrawBook,
+    all_text as draw_all_text,
+    end_text as draw_end_text,
+    list_text as draw_list_text,
+    next_message as draw_next_message,
+    parse_draw_args,
+    pick_winners,
+)
 from .core.files import FileRepository, format_size
 from .core.media import (
     cleanup_temp,
@@ -84,7 +96,7 @@ from .core.utils import (
 )
 
 PLUGIN_NAME = "ZM-QQGroupmgr"
-PLUGIN_VERSION = "1.0.7"
+PLUGIN_VERSION = "1.0.8"
 
 # 版本检查与更新提示指向的仓库
 PLUGIN_REPO = "ZomebieMask/astrbot_plugin_zm_qqgroupmgr"
@@ -262,12 +274,14 @@ class ZMQQGroupmgr(Star):
         self.mutes_store = JsonStore("mutes.json")
         self.files_store = JsonStore("files.json")
         self.reports_store = JsonStore("reports.json")
+        self.draws_store = JsonStore("draws.json")
 
         self.sensitive = SensitiveWordEngine(self.words_store, self.config)
         self.mutes = MuteTracker(self.mutes_store)
         self.files = FileRepository(self.files_store, self.config)
         self.cards = CardCache()
         self.reports = ReportBook(self.reports_store)
+        self.draws = DrawBook(self.draws_store)
 
         self.flood = FloodDetector(
             threshold=coerce_int(self.config.get("flood_threshold"), 5),
@@ -295,6 +309,10 @@ class ZMQQGroupmgr(Star):
         # 待验证的新成员：(群号, QQ号) -> {code, is_sha, deadline}
         # 只放内存：重载后没人还记得当初发的验证码，留着也没意义
         self._pending_verify: dict = {}
+        # 正在发开奖消息的抽奖，这期间 /draw_cancel 不能再答应取消
+        self._announcing: Optional[dict] = None
+        # 已提示过未连接的账号，免得每分钟记一条日志
+        self._draw_offline: set = set()
 
     async def initialize(self):
         """插件加载后启动文件下载服务。"""
@@ -350,7 +368,12 @@ class ZMQQGroupmgr(Star):
             await self.server.stop()
             self.server = None
         for store in (
-            self.settings, self.words_store, self.mutes_store, self.files_store, self.reports_store
+            self.settings,
+            self.words_store,
+            self.mutes_store,
+            self.files_store,
+            self.reports_store,
+            self.draws_store,
         ):
             await store.save()
         logger.info("[ZM-QQGroupmgr] 插件已卸载")
@@ -570,22 +593,24 @@ class ZMQQGroupmgr(Star):
         return [], "私聊使用时必须显式指定群号，例: /g pp 12345678"
 
     # ------------------------------------------------------------------
-    # 后台定时任务：长禁言续期 / 动态答案刷新 / 新版本检查
+    # 后台定时任务：长禁言续期 / 动态答案刷新 / 新版本检查 / 报告提醒 / 抽奖开奖
     # ------------------------------------------------------------------
 
-    def _client(self):
-        """取 aiocqhttp 适配器的 client。后台任务手里没有 event，只能这样拿。"""
+    def _clients(self) -> list:
+        """全部 aiocqhttp 适配器的 client。后台任务手里没有 event，只能这样拿。"""
         try:
-            for platform in self.context.platform_manager.platform_insts:
-                if platform.meta().name == "aiocqhttp":
-                    return platform.get_client()
+            return [
+                platform.get_client()
+                for platform in self.context.platform_manager.platform_insts
+                if platform.meta().name == "aiocqhttp"
+            ]
         except Exception as exc:
             logger.debug(f"[ZM-QQGroupmgr] 获取 aiocqhttp client 失败: {exc}")
-        return None
+            return []
 
     def _bg_api(self) -> Optional[OneBotApi]:
-        client = self._client()
-        return OneBotApi(client=client) if client is not None else None
+        clients = self._clients()
+        return OneBotApi(client=clients[0]) if clients else None
 
     def _meta(self) -> dict:
         """settings.json 里的全局小状态（上次检查时间等）。
@@ -604,21 +629,24 @@ class ZMQQGroupmgr(Star):
         return max(1, min(value, MAX_POLL_MINUTES))
 
     async def _ticker(self) -> None:
-        """一个循环干四件事，省掉四套定时器。
+        """一个循环干五件事，省掉五套定时器。
 
         ponytail: 60 秒粒度的轮询，够用；要秒级精度再改成每条记录一个定时器。
         """
+        jobs = (
+            self._renew_long_mutes,
+            self._refresh_dynamic_answers,
+            self._check_update,
+            self._remind_reports,
+            self._settle_draws,
+        )
         while True:
-            try:
-                await asyncio.sleep(60)
-                await self._renew_long_mutes()
-                await self._refresh_dynamic_answers()
-                await self._check_update()
-                await self._remind_reports()
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:  # 单次异常不能让整个循环停掉
-                logger.warning(f"[ZM-QQGroupmgr] 后台任务异常: {exc}")
+            await asyncio.sleep(60)
+            for job in jobs:
+                try:
+                    await job()
+                except Exception as exc:  # 一件事出错不能耽误另外几件，也不能让循环停掉
+                    logger.warning(f"[ZM-QQGroupmgr] 后台任务 {job.__name__} 异常: {exc}")
 
     async def _renew_long_mutes(self) -> None:
         """超过 30 天的禁言到点续期。"""
@@ -747,9 +775,7 @@ class ZMQQGroupmgr(Star):
         logger.info(f"[ZM-QQGroupmgr] 发现新版本 v{latest}，已在 {sent} 个群提示")
 
     async def _remind_reports(self) -> None:
-        """每 report_remind_minutes 分钟，在还有未解决报告的群里列一遍。"""
-        if not self.config.get("report_remind_enabled", True):
-            return
+        """每 report_remind_minutes 分钟，在还有未解决报告且开着提醒的群里列一遍。"""
         minutes = max(1, coerce_int(self.config.get("report_remind_minutes"), 60))
         meta = self._meta()
         now = int(time.time())
@@ -771,7 +797,9 @@ class ZMQQGroupmgr(Star):
         # 机器人已经退出的群跳过，不然那里的未解决报告会每轮发送失败刷一次日志
         joined = {str(item.get("group_id")) for item in await api.group_list()}
         for group_id in self.reports.groups_with_open():
-            if joined and group_id not in joined:
+            if (joined and group_id not in joined) or not self._group_flag(
+                group_id, "report_remind", self._remind_default()
+            ):
                 continue
             # 用消息段而不是 CQ 字符串：报告内容是成员写的，拼进字符串就得逐个转义
             segments = []
@@ -779,15 +807,138 @@ class ZMQQGroupmgr(Star):
                 members = await api.member_list(int(group_id))
                 for uid in remind_targets(members, configured, bot_id):
                     segments.append({"type": "at", "data": {"qq": uid}})
+            # 查成员期间队列可能刚被清空，别 @ 完了说没有问题
+            if not self.reports.open_reports(group_id):
+                continue
             text = digest_text(self.reports, group_id)
             segments.append({"type": "text", "data": {"text": ("\n" if segments else "") + text}})
             await api.send_group_msg(int(group_id), segments)
             await asyncio.sleep(BATCH_INTERVAL)
 
+    async def _draw_account(self, self_id: str) -> Optional[tuple]:
+        """发起抽奖的 QQ 账号：返回 ``(api, 账号, 所在群号)``，没连着返回 None。
+
+        按账号找而不是取第一个适配器：适配器顺序会因为改配置而变。
+        """
+        # 手改过的 self_id 可能是 "²" 或几千位数字，int() 会抛异常，把整轮开奖都卡住
+        target = int(self_id) if self_id.isdecimal() and len(self_id) <= 20 else None
+        for client in self._clients():
+            api = OneBotApi(client=client, self_id=target)
+            # 账号不在这个适配器上是常态，不走 api.call，免得每分钟记一条错误日志
+            try:
+                login = await client.api.call_action("get_login_info", **api.route)
+                groups = await client.api.call_action("get_group_list", **api.route)
+                bot_id = str(login.get("user_id") or "")
+                joined = {str(item.get("group_id")) for item in groups}
+            except Exception:
+                continue
+            if bot_id and (target is None or bot_id == self_id):
+                return api, bot_id, joined
+        return None
+
+    async def _settle_draws(self) -> None:
+        """到点的抽奖开奖。账号离线期间到点的，连上后第一轮补开。"""
+        accounts = {}
+        for group_id, name, draw in self.draws.due(time.time()):
+            self_id = str(draw.get("self_id") or "")
+            if self_id not in accounts:
+                accounts[self_id] = await self._draw_account(self_id)
+            account = accounts[self_id]
+            if account is None:  # 没连着不算开奖失败，等多久都行
+                if self_id not in self._draw_offline:
+                    self._draw_offline.add(self_id)
+                    logger.warning(f"[ZM-QQGroupmgr] 账号 {self_id} 未连接，到点的抽奖等它连上后开奖")
+                continue
+            self._draw_offline.discard(self_id)
+            # 等协议端或开上一条的时候，这条可能已被取消
+            if self.draws.get(group_id, name) is not draw:
+                continue
+            api, bot_id, joined = account
+            try:
+                failure = (
+                    await self._settle_draw(api, group_id, name, draw, bot_id)
+                    if group_id in joined
+                    else "机器人不在该群"
+                )
+            except Exception as exc:  # 一条坏记录不能卡住别的群开奖
+                failure = f"{type(exc).__name__}: {exc}"
+            if failure:
+                await self._retry_draw(group_id, name, draw, failure)
+            await asyncio.sleep(BATCH_INTERVAL)
+
+    async def _retry_draw(self, group_id: str, name: str, draw: dict, failure: str) -> None:
+        if self.draws.get(group_id, name) is not draw:
+            return
+        if self.draws.retry_later(draw, time.time()):
+            await self.draws_store.save()
+            logger.warning(f"[ZM-QQGroupmgr] 群 {group_id} 抽奖「{name}」开奖失败（{failure}），稍后重试")
+            return
+        await self.draws.remove(group_id, name)
+        logger.error(
+            f"[ZM-QQGroupmgr] 群 {group_id} 抽奖「{name}」多次开奖失败（{failure}），已放弃。"
+            f"已公布 {coerce_int(draw.get('announced'), 0)} 人，"
+            f"未通报的中奖者: {draw.get('winners') or '无'}"
+        )
+
+    async def _settle_draw(
+        self, api: OneBotApi, group_id: str, name: str, draw: dict, bot_id: str
+    ) -> str:
+        """开奖一条，返回失败原因；开完或已被取消返回空串。"""
+        if not isinstance(draw.get("winners"), list):
+            # 开奖时才取成员：强制抽奖要算上后来进群的，报名抽奖要去掉退群的
+            members = await api.member_list(int(group_id), no_cache=True)
+            if self.draws.get(group_id, name) is not draw:  # 查询期间被取消
+                return ""
+            if not members:  # 查不到不能当成没人参与，否则接口抖一下抽奖就作废了
+                return "查询群成员失败"
+            draw["winners"] = pick_winners(draw, members, bot_id)
+
+        tip = str(self.config.get("draw_claim_tip") or DEFAULT_CLAIM_TIP)
+        self._announcing = draw
+        try:
+            # 先落盘再发：发送超时不代表没发出去，重试时必须还是同一批人
+            await self.draws_store.save()
+            # ponytail: 至少一次语义，回执丢失或进程崩溃时这一条会重发；恰好一次要协议端支持幂等
+            while True:
+                # 落盘期间中奖者可能全退了、名单已被清掉：等下一轮重抽，不能公布无人中奖
+                if not isinstance(draw.get("winners"), list):
+                    return "中奖者已退群，等待重新抽取"
+                message, chunk = draw_next_message(name, draw, tip)
+                # 领奖提示只在最后一条。要在发送前判断：发送期间剩下的人退群时，提示还得单独补发
+                last = len(chunk) == len(draw["winners"])
+                if not await api.try_ok("send_group_msg", group_id=int(group_id), message=message):
+                    return "开奖消息发送失败"
+                # 按人移除而不是切片：发送期间名单可能因有人退群而变
+                draw["winners"] = [
+                    uid for uid in draw.get("winners") or [] if str(uid) not in chunk
+                ]
+                # 有进展就重新计数，否则人多的抽奖发到一半就用完重试次数
+                draw["announced"] = coerce_int(draw.get("announced"), 0) + len(chunk)
+                draw["attempts"] = 0
+                if last:
+                    break
+                await self.draws_store.save()
+                await asyncio.sleep(BATCH_INTERVAL)
+            await self.draws.remove(group_id, name)
+        finally:
+            self._announcing = None
+        logger.info(
+            f"[ZM-QQGroupmgr] 群 {group_id} 抽奖「{name}」已开奖，中奖 {draw['announced']} 人"
+        )
+        return ""
+
+    def _group_flag(self, group_id: str, key: str, default: bool = True) -> bool:
+        """settings.json 里按群保存的开关，没设置过就用 ``default``。"""
+        value = self.settings.group(str(group_id)).get(key)
+        return default if value is None else bool(value)
+
+    def _remind_default(self) -> bool:
+        """没用过 /rmd 的群是否提醒未解决的报告，听插件配置的。"""
+        return bool(self.config.get("report_remind_enabled", True))
+
     def _update_notify_enabled(self, group_id: str) -> bool:
         """/update 开关，默认开启。"""
-        value = self.settings.group(str(group_id)).get("update_notify")
-        return True if value is None else bool(value)
+        return self._group_flag(group_id, "update_notify")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("update")
@@ -3664,6 +3815,7 @@ class ZMQQGroupmgr(Star):
         removed = await self.reports.remove_user(group_id, user_id)
         if removed:
             logger.info(f"[ZM-QQGroupmgr] {user_id} 已离开群 {group_id}，删除其 {removed} 条报告")
+        await self.draws.drop_member(group_id, user_id)
 
         state = self._farewell(group_id)
         if not state.get("enabled"):
@@ -3780,6 +3932,9 @@ class ZMQQGroupmgr(Star):
         if not group_id:
             yield event.plain_result(ADMIN_ONLY)
             return
+        if not self._group_flag(group_id, "report_enabled"):
+            yield event.plain_result("本群的问题反馈功能已关闭")
+            return
 
         content = self._raw_after(event, "report")
         if not content:
@@ -3809,12 +3964,16 @@ class ZMQQGroupmgr(Star):
         )
 
     async def _can_handle_reports(self, event: AstrMessageEvent, group_id: str) -> bool:
-        """/solve、/drh 谁能用：AstrBot 管理员、本群群主和管理员、report_solve_users 里的 QQ。"""
+        """处理报告的指令谁能用：群管理（见下）和 report_solve_users 里的 QQ。"""
+        if str(event.get_sender_id()) in coerce_str_list(self.config.get("report_solve_users")):
+            return True
+        return await self._is_group_manager(event, group_id)
+
+    async def _is_group_manager(self, event: AstrMessageEvent, group_id: str) -> bool:
+        """AstrBot 管理员，或本群群主、管理员。"""
         if event.is_admin():
             return True
         user_id = str(event.get_sender_id())
-        if user_id in coerce_str_list(self.config.get("report_solve_users")):
-            return True
         raw = getattr(event.message_obj, "raw_message", None)
         sender = raw.get("sender") if isinstance(raw, dict) else None
         role = sender.get("role") if isinstance(sender, dict) else None
@@ -3905,6 +4064,180 @@ class ZMQQGroupmgr(Star):
                 else f"QQ:{user_id} 在本群没有报告记录"
             )
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("rl")
+    async def cmd_report_list(self, event: AstrMessageEvent):
+        """/rl [页码] - 发送当前的反馈列表"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._can_handle_reports(event, group_id):
+            yield event.plain_result(REPORT_HANDLER_ONLY.format(command="/rl"))
+            return
+
+        args = self._args(event, "rl")
+        page = coerce_int(args[0], 1) if args else 1
+        yield event.plain_result(digest_text(self.reports, group_id, page))
+
+    @filter.command("rclear")
+    async def cmd_report_clear(self, event: AstrMessageEvent):
+        """/rclear - 清空本群未解决的报告队列，已解决的历史保留"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._can_handle_reports(event, group_id):
+            yield event.plain_result(REPORT_HANDLER_ONLY.format(command="/rclear"))
+            return
+
+        removed = await self.reports.clear_open(group_id)
+        yield event.plain_result(f"已清空 {removed} 个未解决的报告" if removed else "队列是空的")
+
+    @filter.command("rsw")
+    async def cmd_report_switch(self, event: AstrMessageEvent):
+        """/rsw on|off - 开启或关闭本群的 /report"""
+        async for result in self._report_toggle(event, "rsw", "report_enabled", True, "问题反馈功能"):
+            yield result
+
+    @filter.command("rmd")
+    async def cmd_report_remind(self, event: AstrMessageEvent):
+        """/rmd on|off - 开启或关闭本群的反馈列表提醒"""
+        async for result in self._report_toggle(
+            event, "rmd", "report_remind", self._remind_default(), "反馈列表提醒"
+        ):
+            yield result
+
+    async def _report_toggle(
+        self, event: AstrMessageEvent, command: str, key: str, default: bool, label: str
+    ):
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._can_handle_reports(event, group_id):
+            yield event.plain_result(REPORT_HANDLER_ONLY.format(command=f"/{command}"))
+            return
+
+        args = self._args(event, command)
+        action = args[0].lower() if args else ""
+        if action not in {"on", "off"}:
+            state = "开启" if self._group_flag(group_id, key, default) else "关闭"
+            yield event.plain_result(f"用法: /{command} on|off\n当前状态: {state}")
+            return
+
+        self.settings.group(group_id)[key] = action == "on"
+        await self.settings.save()
+        yield event.plain_result(f"已{'开启' if action == 'on' else '关闭'}本群的{label}")
+
+    # ------------------------------------------------------------------
+    # 抽奖：/draw 发起、/join_draw 参与、/draw_cancel 取消，到点由 _settle_draws 开奖
+    # ------------------------------------------------------------------
+
+    @filter.command("draw")
+    async def cmd_draw(self, event: AstrMessageEvent):
+        """/draw <抽奖名> <中奖人数> <时间> <是否强制群成员抽奖> [最大参与人数] - 发起抽奖"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._is_group_manager(event, group_id):
+            yield event.plain_result("/draw 仅 AstrBot 管理员、群主、群管理员可用")
+            return
+        # 开奖要查群成员、@ 中奖者，别的平台做不到，别等到点才发现
+        if not OneBotApi(event).available:
+            yield event.plain_result(QQ_ONLY)
+            return
+
+        args = self._args(event, "draw")
+        if not args:
+            yield event.plain_result(DRAW_USAGE + "\n\n" + draw_list_text(self.draws, group_id))
+            return
+        fields, error = parse_draw_args(args)
+        if fields is None:
+            yield event.plain_result(error)
+            return
+
+        name = fields["name"]
+        if self.draws.total() >= MAX_DRAWS:
+            yield event.plain_result(
+                f"抽奖已达上限，所有群合计最多同时存在 {MAX_DRAWS} 个抽奖\n"
+                f"本群占用 {len(self.draws.draws(group_id))} 个，"
+                "其他群的名额可由 AstrBot 管理员私聊发送 /draw_cancel 查看和取消"
+            )
+            return
+        if self.draws.get(group_id, name) is not None:
+            yield event.plain_result(f"本群已有名为「{name}」的抽奖，请换个名字")
+            return
+
+        draw = await self.draws.add(group_id, fields, str(event.get_self_id() or ""))
+        if draw["forced"]:
+            how = "全体成员自动参与，无需报名"
+        else:
+            how = f"发送 /jd {name} 参与" + (f"，限 {draw['limit']} 人" if draw["limit"] else "")
+        yield event.plain_result(
+            f"抽奖「{name}」已开启\n"
+            f"中奖人数: 最多 {draw['winner_count']} 人\n"
+            f"开奖时间: {draw_end_text(draw)}\n"
+            f"参与方式: {how}"
+        )
+
+    @filter.command("join_draw", alias={"jd"})
+    async def cmd_join_draw(self, event: AstrMessageEvent):
+        """/join_draw <抽奖名> - 参与抽奖（缩写 /jd，全体成员可用）；不带参数列出进行中的抽奖"""
+        group_id = self._require_group(event)
+        if not group_id:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+
+        name = self._raw_after(event, "join_draw", "jd")
+        if not name:
+            yield event.plain_result(
+                draw_list_text(self.draws, group_id) + "\n\n用法: /jd <抽奖名>"
+            )
+            return
+        yield self._quote(event, await self.draws.join(group_id, name, str(event.get_sender_id())))
+
+    @filter.command("draw_cancel")
+    async def cmd_draw_cancel(self, event: AstrMessageEvent):
+        """/draw_cancel <抽奖名> - 取消抽奖；AstrBot 管理员可用 /draw_cancel <群号> <抽奖名> 跨群取消"""
+        group_id = self._require_group(event)
+        bot_admin = event.is_admin()
+        if not group_id and not bot_admin:
+            yield event.plain_result(ADMIN_ONLY)
+            return
+        if not await self._is_group_manager(event, group_id):
+            yield event.plain_result("/draw_cancel 仅 AstrBot 管理员、群主、群管理员可用")
+            return
+
+        # 抽奖名不含空格，两段就是「群号 抽奖名」。名额所有群共用，别的群占着时只有这条路能释放
+        args = self._args(event, "draw_cancel")
+        target, name = args if bot_admin and len(args) == 2 else (group_id, " ".join(args))
+        # 所有群的列表只在私聊给：发在群里，全群都能看到别的群的群号和抽奖名
+        listing = draw_list_text(self.draws, group_id) if group_id else draw_all_text(self.draws)
+        if not target or not name:
+            usage = "用法: /draw_cancel <抽奖名>"
+            if bot_admin:
+                usage += "\n跨群或私聊: /draw_cancel <群号> <抽奖名>\n私聊发送 /draw_cancel 可查看所有群的抽奖"
+            yield event.plain_result(f"{listing}\n\n{usage}")
+            return
+
+        draw = self.draws.get(target, name)
+        if draw is None:
+            yield event.plain_result(f"没有名为「{name}」的抽奖\n\n{listing}")
+            return
+        # 已公布一部分的，群管理取消会让剩下的中奖者没有说法；AstrBot 管理员要能释放卡住的名额
+        if draw is self._announcing or (draw.get("announced") and not bot_admin):
+            yield event.plain_result(f"抽奖「{name}」已开始公布中奖名单，无法取消")
+            return
+
+        await self.draws.remove(target, name)
+        reply = f"抽奖「{name}」已取消"
+        if draw.get("announced"):
+            pending = draw.get("winners") or []
+            logger.info(f"[ZM-QQGroupmgr] 群 {target} 抽奖「{name}」被管理员取消，未通报的中奖者: {pending}")
+            reply += f"\n此前已公布 {draw['announced']} 人，未公布的 {len(pending)} 人不再通报"
+        yield event.plain_result(reply)
 
     # ------------------------------------------------------------------
     # 帮助
@@ -4019,9 +4352,22 @@ class ZMQQGroupmgr(Star):
             "/check_report           查看自己报告的进度和历史（缩写 /cr，全体可用）\n"
             "/solve <编号> <回复>     标记解决并回复报告人；不带参数列出未解决的\n"
             "/drh <成员>              删除该成员在本群的全部报告记录\n"
-            "  /solve、/drh 群主、群管理和 report_solve_users 里的成员也可用\n"
+            "/rl [页码]               发送当前的反馈列表\n"
+            "/rclear                 清空未解决的报告队列，已解决的历史保留\n"
+            "/rsw on|off             开启 / 关闭本群的 /report\n"
+            "/rmd on|off             开启 / 关闭本群的反馈列表提醒\n"
+            "  除 /report、/cr 外，群主、群管理和 report_solve_users 里的成员也可用\n"
             "  成员退群后，其报告记录自动删除\n"
             "  未解决的报告每 report_remind_minutes 分钟在群里提醒一次\n\n"
+            "【抽奖】群主、群管理也可用\n"
+            "/draw <抽奖名> <中奖人数> <时间> <是否强制群成员抽奖> [最大参与人数]\n"
+            "  <时间> 单位小时，最大 99999；不带参数列出进行中的抽奖\n"
+            "  true 全体成员自动参与，含后来进群的；false 成员发送 /jd 参与\n"
+            "  [最大参与人数] 选填，不填不限人数\n"
+            "/draw_cancel <抽奖名>    取消抽奖\n"
+            "/draw_cancel <群号> <抽奖名>  跨群取消，私聊可用；私聊不带参数列出所有群（仅 AstrBot 管理员）\n"
+            "/join_draw <抽奖名>      参与抽奖（缩写 /jd，全体可用）\n"
+            "  所有群合计最多同时 5 个；到点随机 @ 中奖者并通报 QQ，领奖提示见配置 draw_claim_tip\n\n"
             "【其他】\n"
             "/merge <标题> <qq> <内容> [...]  构造合并转发，标题即卡片名（全体可用）\n"
             "/kill <成员> <理由>              赛博击杀播报\n"

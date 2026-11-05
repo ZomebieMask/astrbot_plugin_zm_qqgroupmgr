@@ -24,8 +24,10 @@ def get_client(event):
 class OneBotApi:
     """把常用群管理动作包装成方法，统一异常与日志。"""
 
-    def __init__(self, event=None, client=None):
+    def __init__(self, event=None, client=None, self_id: Optional[int] = None):
         self.event = event
+        # 后台调用要指明账号：同一适配器连着多个账号时，不指明 aiocqhttp 不知道走哪个
+        self.route = {"self_id": self_id} if self_id else {}
         # 后台任务（禁言续期、版本检查）手里没有 event，直接拿适配器的 client
         self.client = client if client is not None else get_client(event)
 
@@ -38,7 +40,7 @@ class OneBotApi:
         if self.client is None:
             raise RuntimeError("当前平台不支持该操作，仅支持 QQ (aiocqhttp)")
         try:
-            return await self.client.api.call_action(action, **payload)
+            return await self.client.api.call_action(action, **self.route, **payload)
         except Exception as exc:
             logger.error(f"[ZM-QQGroupmgr] 调用 {action} 失败: {exc}")
             raise RuntimeError(str(exc)) from exc
@@ -230,8 +232,10 @@ class OneBotApi:
             return str(info.get("nickname") or user_id)
         return str(user_id)
 
-    async def member_list(self, group_id: int) -> List[Dict[str, Any]]:
-        result = await self.try_call("get_group_member_list", group_id=int(group_id))
+    async def member_list(self, group_id: int, no_cache: bool = False) -> List[Dict[str, Any]]:
+        # 只在需要时才带 no_cache，其余调用的请求内容保持不变
+        extra = {"no_cache": True} if no_cache else {}
+        result = await self.try_call("get_group_member_list", group_id=int(group_id), **extra)
         return result if isinstance(result, list) else []
 
     async def member_info(self, group_id: int, user_id: int) -> Dict[str, Any]:

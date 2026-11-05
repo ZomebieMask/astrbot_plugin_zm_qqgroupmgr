@@ -230,7 +230,7 @@
   },
   "report_remind_enabled": {
     "description": "是否定时提醒未解决的问题报告",
-    "hint": "开启后每隔 report_remind_minutes 分钟，在还有未解决 /report 的群里列出全部未解决问题的编号、内容与报告人 QQ",
+    "hint": "开启后每隔 report_remind_minutes 分钟，在还有未解决 /report 的群里列出未解决问题的编号、内容与报告人 QQ。这里是默认值，群内用过 /rmd 的以群内设置为准",
     "type": "bool",
     "default": true
   },
@@ -253,10 +253,16 @@
     "default": []
   },
   "report_solve_users": {
-    "description": "可使用 /solve、/drh 的 QQ 号",
+    "description": "可使用 /solve、/drh、/rl、/rclear、/rsw、/rmd 的 QQ 号",
     "hint": "每行一个。AstrBot 管理员和本群群主、群管理员本来就能用，这里填其他需要处理问题报告的人",
     "type": "list",
     "default": []
+  },
+  "draw_claim_tip": {
+    "description": "抽奖开奖时的领奖提示",
+    "hint": "跟在中奖名单后面发送。占位符：{name} 抽奖名 / {count} 实际中奖人数",
+    "type": "text",
+    "default": "请以上中奖者尽快联系管理员领奖"
   },
   "media_wait_timeout": {
     "description": "两步指令等待图片 / 答复的超时时间（秒）",

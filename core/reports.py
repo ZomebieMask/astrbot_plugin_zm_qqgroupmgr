@@ -1,12 +1,12 @@
-"""问题反馈队列：/report 排队、/solve 处理、/check_report 查询。"""
+"""问题反馈队列：/report 排队、/solve 处理、/check_report 查询、/rl /rclear 管理。"""
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .store import JsonStore, coerce_int
 
-# 提醒和 /cr 最多列多少条：内容最长 200 字，再多一条 QQ 消息就装不下了
+# 提醒和 /rl 每页列多少条：内容最长 200 字，再多一条 QQ 消息就装不下了
 DIGEST_LIMIT = 10
 HISTORY_LIMIT = 5
 # /report 全体成员可用，内容长度和每人同时挂着的数量都得有个头，不然一个人就能把队列刷满。
@@ -102,16 +102,19 @@ class ReportBook:
 
     async def remove_user(self, group_id: str, user_id: str) -> int:
         """删掉某人在本群的全部报告（含未解决的），返回删了几条。"""
+        # 手改过的 reports.json 里 user_id 可能是数字，统一转字符串再比
+        return await self._remove(group_id, lambda item: str(item.get("user_id")) == str(user_id))
+
+    async def clear_open(self, group_id: str) -> int:
+        """清空本群的排队队列，已解决的留作历史，返回删了几条。"""
+        return await self._remove(group_id, lambda item: not item.get("solved"))
+
+    async def _remove(self, group_id: str, matches: Callable[[Dict[str, Any]], bool]) -> int:
         bucket = self.store.get(str(group_id))
         items = bucket.get("reports") if isinstance(bucket, dict) else None
         if not isinstance(items, list):
             return 0
-        # 手改过的 reports.json 里 user_id 可能是数字，统一转字符串再比
-        kept = [
-            item
-            for item in items
-            if not (isinstance(item, dict) and str(item.get("user_id")) == str(user_id))
-        ]
+        kept = [item for item in items if not (isinstance(item, dict) and matches(item))]
         removed = len(items) - len(kept)
         if removed:
             items[:] = kept
@@ -136,21 +139,25 @@ def remind_targets(members: List[Dict[str, Any]], configured: List[str], bot_id:
     ]
 
 
-def digest_text(book: ReportBook, group_id: str) -> str:
-    """未解决报告一览，定时提醒和不带参数的 /solve 共用。"""
+def digest_text(book: ReportBook, group_id: str, page: int = 1) -> str:
+    """未解决报告一览，定时提醒、不带参数的 /solve 和 /rl 共用。"""
     waiting = book.open_reports(group_id)
     if not waiting:
         return "本群目前没有未解决的问题"
 
+    pages = (len(waiting) - 1) // DIGEST_LIMIT + 1
+    page = max(1, min(page, pages))
+    start = (page - 1) * DIGEST_LIMIT
+
     lines = [f"本群当前还有 {len(waiting)} 个问题未解决："]
-    for item in waiting[:DIGEST_LIMIT]:
+    for item in waiting[start:start + DIGEST_LIMIT]:
         when = time.strftime("%m-%d %H:%M", time.localtime(coerce_int(item.get("time"), 0)))
         lines.append(
             f"{item.get('no')}  |  QQ:{item.get('user_id')}  |  {when}  |  "
             f"{_one_line(item.get('content'))}"
         )
-    if len(waiting) > DIGEST_LIMIT:
-        lines.append(f"……其余 {len(waiting) - DIGEST_LIMIT} 个未列出")
+    if pages > 1:
+        lines.append(f"第 {page}/{pages} 页，发送 /rl <页码> 查看其他页")
     return "\n".join(lines)
 
 
