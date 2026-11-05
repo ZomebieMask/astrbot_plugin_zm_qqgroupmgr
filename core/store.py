@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -55,7 +56,6 @@ def backup_on_upgrade(version: str) -> Optional[str]:
     只是为了防「新版本写坏了老数据」——真出事时把目录拷回来即可。
     """
     import shutil
-    import time
 
     root = get_data_dir()
     marker = root / "VERSION"
@@ -88,6 +88,9 @@ def backup_on_upgrade(version: str) -> Optional[str]:
 class JsonStore:
     """一个 JSON 文件对应一类数据，写入走临时文件 + 原子替换。"""
 
+    # 读取失败又没法把原文件挪开时置位：本次运行不再写盘，否则会把它覆盖掉
+    _frozen = False
+
     def __init__(self, filename: str):
         self.path = get_data_dir() / filename
         self._data: Dict[str, Any] = {}
@@ -100,17 +103,34 @@ class JsonStore:
         try:
             with open(self.path, "r", encoding="utf-8") as handle:
                 loaded = json.load(handle)
-            if isinstance(loaded, dict):
-                self._data = loaded
+            if not isinstance(loaded, dict):
+                raise ValueError("顶层不是 JSON 对象")
+            self._data = loaded
         except Exception as exc:
             logger.error(f"[ZM-QQGroupmgr] 读取 {self.path.name} 失败: {exc}")
+            # 改名留着，否则下一次保存会用空数据覆盖它，手改多打个逗号数据就全没了
+            kept = self.path.with_name(f"{self.path.name}.corrupt-{int(time.time())}")
+            try:
+                os.replace(self.path, kept)
+                # 必须先停用：插件运行中放回去，会被内存里的空数据覆盖
+                logger.error(
+                    f"[ZM-QQGroupmgr] 原文件已保留为 {kept.name}。恢复方法：先停用插件或关闭 AstrBot，"
+                    f"修好后改回 {self.path.name}（覆盖同名文件），再启用"
+                )
+            except OSError as move_exc:
+                self._frozen = True
+                logger.error(
+                    f"[ZM-QQGroupmgr] 保留 {self.path.name} 失败: {move_exc}。"
+                    "本次运行不写入该文件，修好后重载插件"
+                )
 
     def _write(self, payload: str) -> None:
         tmp = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            # errors=replace：成员发来的孤立代理字符写不进 UTF-8，不替换的话这份数据以后每次保存都失败
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as handle:
                 handle.write(payload)
             os.replace(tmp, self.path)
             tmp = None
@@ -131,6 +151,8 @@ class JsonStore:
         在改同一个 dict 就会抛 "dictionary changed size during iteration"，
         整次保存直接丢失。
         """
+        if self._frozen:
+            return
         try:
             payload = json.dumps(self._data, ensure_ascii=False, indent=2)
         except Exception as exc:
@@ -207,7 +229,7 @@ def coerce_int(value: Any, default: int) -> int:
     """把配置项转成 int，非法值回退默认。"""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # JSON 里的 Infinity 转 int 是 OverflowError
         return default
 
 

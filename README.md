@@ -8,7 +8,7 @@
 
 **33 组指令 · 12 大模块 · 从禁言踢人到进群审批、问题反馈、敏感词、刷屏、广告、文件分发、跨群批量操作，一站装完**
 
-[![version](https://img.shields.io/badge/version-1.0.7-blue?style=flat-square)](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr/releases)
+[![version](https://img.shields.io/badge/version-1.0.8-blue?style=flat-square)](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr/releases)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%E2%89%A53.4.0-7B68EE?style=flat-square)](https://astrbot.app)
 [![platform](https://img.shields.io/badge/platform-aiocqhttp%20%7C%20nakuru-32CD32?style=flat-square)](https://docs.astrbot.app)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr/blob/main/LICENSE)
@@ -31,7 +31,8 @@
 | :--- | :--- | :--- |
 | 🔨 **成员管理** | 禁言（**最长 3650 天**，自动分段续期）/ 解禁 / 全体禁言 / 禁言列表与剩余时长 / 踢人 / 按不活跃天数清理 / 封禁并自动拒绝加群 / 收放管理员 | `/mute` `/muteall` `/mutelist` `/kick` `/ban` `/op` |
 | 💬 **消息管理** | 回复即撤 / 批量撤回最近 N 条 / 从协议端拉群历史（连机器人自己和插件启动前的消息也能撤）/ 引用即设群精华 | `/recall` `/star` `/rs` |
-| 📮 **问题反馈** | 成员排队提交问题，自动编号；管理员按编号处理并回复；成员随时查进度和历史；未解决的定时提醒并 @ 群管理 | `/report` `/solve` `/cr` `/drh` |
+| 📮 **问题反馈** | 成员排队提交问题，自动编号；管理员按编号处理并回复；成员随时查进度和历史；未解决的定时提醒并 @ 群管理；队列、开关和提醒可按群管理 | `/report` `/solve` `/cr` `/drh` `/rl` `/rclear` `/rsw` `/rmd` |
+| 🎁 **抽奖** | 到点随机 @ 中奖者并通报 QQ，领奖提示可自定义；可全体成员自动参与，也可成员报名并限制人数 | `/draw` `/jd` `/draw_cancel` |
 | 🚫 **敏感词** | 命中即撤回 + 禁言，时长按群独立设置；自定义词 / 远程词库 / 混合三种词源；白名单纠偏 | `/sw` |
 | 🌊 **刷屏检测** | 滑动窗口条数 + 连续重复内容双重判定，阈值可调，按群开关 | `/antiflood` |
 | 🏷️ **名片检测** | 扫群名片里的广告与敏感内容，处理方式可选 warn / reset / mute / kick | `/cardcheck` |
@@ -144,7 +145,7 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 
 ## 📖 指令手册
 
-> 🔒 管理类指令仅 **AstrBot 管理员** 可用。对全体群成员开放的只有 `/file download`、`/file list`、`/file log`（查看）、`/merge`、`/slimefinder`、`/report` 和 `/check_report`；`/solve`、`/drh` 本群群主和管理员也能用。
+> 🔒 管理类指令仅 **AstrBot 管理员** 可用。对全体群成员开放的只有 `/file download`、`/file list`、`/file log`（查看）、`/merge`、`/slimefinder`、`/report`、`/check_report` 和 `/join_draw`；`/solve`、`/drh`、`/rl`、`/rclear`、`/rsw`、`/rmd`、`/draw`、`/draw_cancel` 本群群主和管理员也能用。
 > ⏱️ 时长单位：`s` 秒 · `m` 分 · `h` 时 · `d` 天 · `w` 周。
 
 <details open>
@@ -392,6 +393,10 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 | `/check_report`（`/cr`） | 查看自己最近一次报告的进度和历史报告。**全体成员可用** |
 | `/solve <编号> <回复>` | 把该编号标记为已解决，并 @ 报告人附上回复；不带参数时列出全部未解决问题 |
 | `/drh <成员>` | 删除该成员在本群的全部报告记录（含未解决的），@ 成员或直接写 QQ 号，可一次写多个 |
+| `/rl [页码]` | 发送当前的反馈列表，每页 10 条 |
+| `/rclear` | 清空本群未解决的报告队列，已解决的历史保留 |
+| `/rsw on\|off` | 开启 / 关闭本群的 `/report`，关闭后 `/cr`、`/solve` 仍可用 |
+| `/rmd on\|off` | 开启 / 关闭本群的反馈列表提醒 |
 
 ```
 /report 下载链接打不开          → 报告已收到，报告编号为 3，前方还有 2 个问题等待解决
@@ -413,14 +418,46 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 **编号规则**：编号 = 提交时前方未解决的问题数 + 1，前方没有就是 1 号。管理员没按顺序处理时这个号可能还被别的未解决问题占着，那就往后顺延到空号——**未解决的问题之间编号绝不重复**，`/solve` 不会认错人。问题全部处理完以后，编号重新从 1 开始。
 
 - 内容和 `/solve` 的回复都最长 200 字；同一个人最多同时挂 3 个未解决的报告，防止刷队列
-- 一条消息装不下太多：定时提醒最多列 10 条，`/cr` 显示最近 5 条历史
+- 一条消息装不下太多：定时提醒只列前 10 条，其余用 `/rl <页码>` 翻看；`/cr` 显示最近 5 条历史
 - 报告按群分开排队，存在 `reports.json`，重启不丢
-- **谁能处理**：`/solve`、`/drh` 除 AstrBot 管理员外，本群群主、群管理员也能用；还要让别人处理，把 QQ 号填进 `report_solve_users`
+- **谁能处理**：`/solve`、`/drh`、`/rl`、`/rclear`、`/rsw`、`/rmd` 除 AstrBot 管理员外，本群群主、群管理员也能用；还要让别人处理，把 QQ 号填进 `report_solve_users`
 - 成员退群或被踢后，其报告记录自动删除
 - **定时提醒**：每 `report_remind_minutes` 分钟（默认 60）在还有未解决问题的群里列一遍，每条带编号、报告人 QQ、提交时间和内容。没有未解决问题的群不提醒
-  - `report_remind_enabled` 开关提醒，默认开
+  - `report_remind_enabled` 开关提醒的默认值，默认开；群内用过 `/rmd` 的以群内设置为准
   - `report_remind_at` 提醒时是否 @ 群管理，默认开
   - `report_remind_users` 填了 QQ 号就只 @ 这些人（不在本群的自动跳过）；留空则 @ 本群群主和全部管理员
+
+</details>
+
+<details>
+<summary><b>🎁 抽奖</b></summary>
+
+| 指令 | 说明 |
+| :--- | :--- |
+| `/draw <抽奖名> <中奖人数> <时间> <是否强制群成员抽奖> [最大参与人数]` | 发起抽奖；不带参数时显示用法和进行中的抽奖 |
+| `/join_draw <抽奖名>`（`/jd`） | 参与抽奖；不带参数时列出进行中的抽奖。**全体成员可用** |
+| `/draw_cancel <抽奖名>` | 直接取消抽奖 |
+| `/draw_cancel <群号> <抽奖名>` | 跨群取消，私聊也可用；私聊发送 `/draw_cancel` 列出所有群的抽奖。**仅 AstrBot 管理员** |
+
+```
+/draw 周末福利 3 24 false 100    → 24 小时后开奖，最多 3 人中奖，成员发 /jd 周末福利 参与，限 100 人
+/draw 全员福利 1 72 true         → 72 小时后从当时的全体成员里抽 1 人
+```
+
+- `<抽奖名>` 不能含空格，最长 30 字
+- `<中奖人数>` 是上限，参与者不够时全部中奖；没有符合条件的参与者时通报无人中奖
+- `<时间>` 单位为小时，可以写小数，最大 99999
+- `<是否强制群成员抽奖>` 只能填 `true` 或 `false`
+  - `true`：全体成员自动参与，开奖前进群的都算；填了 `[最大参与人数]` 时，中奖人数不超过它
+  - `false`：成员发 `/jd` 参与，`[最大参与人数]` 不填则不限；开奖前退群的自动移出，空出的名额别人可以补上
+- 所有群合计最多同时存在 5 个抽奖，超过时提示抽奖已达上限。未到点的抽奖和等待账号连接的抽奖都占名额；别的群占着的名额，AstrBot 管理员可以私聊发送 `/draw_cancel` 查看，发送 `/draw_cancel <群号> <抽奖名>` 取消
+- 到点后机器人随机 @ 中奖者并通报 QQ 号，后面跟配置 `draw_claim_tip` 的领奖提示，支持 `{name}` 抽奖名和 `{count}` 中奖人数
+- 中奖超过 20 人时分多条消息发送
+- 抽奖存在 `draws.json`，重启不丢。检查间隔为 1 分钟，开奖可能晚 1 分钟左右
+- 开奖由发起抽奖的 QQ 账号执行；该账号未连接时一直等待，连上后补开
+- 账号已连接但开奖失败时（机器人不在群内、查不到群成员、消息发送失败，例如全体禁言），按 1、2、4……分钟的间隔重试，约 68 小时后放弃，已抽出的名单写入日志。已发出的消息不会从头重发；协议端没有返回发送结果时，同一条可能重复发送
+- 中奖名单公布前退群的中奖者不再通报；名单因此清空时重新抽取
+- 已开始公布中奖名单的抽奖，群主和群管理不能取消；AstrBot 管理员可以取消，未公布的中奖者不再通报。正在发送开奖消息时都不能取消
 
 </details>
 
@@ -477,7 +514,8 @@ git clone https://github.com/ZomebieMask/astrbot_plugin_zm_qqgroupmgr.git
 | ☠️ 赛博击杀 | `kill_template` `kill_notify_all_groups` |
 | 🖼️ 图片交互 | `media_wait_timeout`（等待补发图片/答复秒数，默认 60）`avatar_recall` `broadcast_recall` `farewell_recall`（均默认开启） |
 | 🚪 进群审批 | `join_verify_minutes` `join_code_digits` `join_sha_poll_minutes`(默认 30 分钟) `join_question_text` `join_verify_tip` `join_sha_tip` `join_pass_tip` `join_timeout_tip` `join_decline_tip` |
-| 📮 问题反馈 | `report_remind_enabled`（默认开）`report_remind_minutes`（默认 60）`report_remind_at`（默认开）`report_remind_users`（留空 = 全体群管理）`report_solve_users`（额外可用 `/solve` `/drh` 的 QQ） |
+| 📮 问题反馈 | `report_remind_enabled`（默认开）`report_remind_minutes`（默认 60）`report_remind_at`（默认开）`report_remind_users`（留空 = 全体群管理）`report_solve_users`（额外可用 `/solve` `/drh` `/rl` `/rclear` `/rsw` `/rmd` 的 QQ） |
+| 🎁 抽奖 | `draw_claim_tip`（开奖时的领奖提示，占位符 `{name}` `{count}`） |
 | 🔔 更新通知 | `update_check_days` `update_tip` |
 | 📜 帮助菜单 | `help_menu_text` —— 留空用内置完整菜单；填写后 `/zmhelp` 只显示你写的内容，支持 `{name}` `{version}` `{cooldown}` 三个占位符 |
 
@@ -532,6 +570,8 @@ QQ 侧限制：群专属头衔通常**只有群主**能设置，机器人只是�
 **不用。** 所有运行数据都存在插件目录之外的 `data/plugin_data/ZM-QQGroupmgr/`（封禁列表、各类文本、开关、自定义敏感词、文件仓库、更新日志、问题报告），后台面板里的配置项由 AstrBot 存在 `data/config/` 下。覆盖安装、插件市场更新、`git pull` 都不会碰这两处，升级后原样继续用。
 
 额外保险：插件检测到版本号变化时，会先把数据目录里的 `*.json` 快照到 `data/plugin_data/ZM-QQGroupmgr/backups/<旧版本>-<时间戳>/`。真遇到新版本写坏老数据，把这个目录里的文件拷回上一层即可。
+
+数据文件读取失败（比如手改时多打了一个逗号）时，原文件会改名保留为 `<文件名>.corrupt-<时间戳>`。恢复时请**先停用插件或关闭 AstrBot**，修好后改回原名（覆盖同名文件），再启用；插件运行中放回去会被覆盖。
 
 只有两处是内存态、重启会清空：批量撤回用的消息历史（每群 100 条）、进群验证的待验证名单（重载后作废，不会误踢人）。
 

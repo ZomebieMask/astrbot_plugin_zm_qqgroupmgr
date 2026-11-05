@@ -529,6 +529,674 @@ def test_report_handlers(main):
     print("  /solve /drh 权限: Bot 管理 / 群主群管 / 指定 QQ / 现查身份 OK")
 
 
+def test_report_admin(main):
+    """/rclear 只清未解决的，/rl 翻页，/rsw /rmd 按群开关，提醒听 /rmd 的。"""
+    import asyncio
+
+    rp = sys.modules["zmplugin.core.reports"]
+
+    class FakeStore(dict):
+        def group(self, gid):
+            return self.setdefault(gid, {})
+
+        def set(self, key, value):
+            self[key] = value
+
+        async def save(self):
+            pass
+
+    book = rp.ReportBook(FakeStore())
+    for i in range(23):
+        asyncio.run(book.add("100", str(1000 + i), f"问题{i}"))
+    asyncio.run(book.solve("100", 1, "好了", "9"))
+
+    first, last = rp.digest_text(book, "100"), rp.digest_text(book, "100", 3)
+    assert "问题1\n" in first and "第 1/3 页" in first and "问题22" not in first, first
+    assert "问题22" in last and "第 3/3 页" in last, last
+    assert rp.digest_text(book, "100", 99) == last and rp.digest_text(book, "100", -1) == first
+
+    assert asyncio.run(book.clear_open("100")) == 22
+    assert book.open_reports("100") == [] and book.user_reports("100", "1000"), "已解决的要留着"
+    assert asyncio.run(book.clear_open("100")) == 0
+    assert asyncio.run(book.clear_open("404")) == 0 and "404" not in book.store
+
+    inst = object.__new__(main.ZMQQGroupmgr)
+    inst.settings = FakeStore()
+    inst.config = {"report_remind_enabled": False}
+    assert inst._group_flag("1", "report_enabled"), "/report 默认开"
+    assert not inst._group_flag("1", "report_remind", inst._remind_default()), "默认听插件配置"
+    inst.settings.group("1")["report_remind"] = True
+    assert inst._group_flag("1", "report_remind", inst._remind_default()), "群内设置优先"
+
+    # 查成员期间队列被清空：不能 @ 完了说没有问题
+    class RemindApi:
+        sent = []
+
+        async def try_call(self, action, **kw):
+            return {"user_id": 8}
+
+        async def group_list(self):
+            return [{"group_id": 100}]
+
+        async def member_list(self, group_id):
+            await book.clear_open("100")
+            return [{"user_id": 1, "role": "owner"}]
+
+        async def send_group_msg(self, group_id, message):
+            self.sent.append(message)
+
+    asyncio.run(book.add("100", "1", "还没解决"))
+    inst.settings.group("100")["report_remind"] = True
+    inst.reports = book
+    inst._bg_api = RemindApi
+    asyncio.run(inst._remind_reports())
+    assert RemindApi.sent == []
+    print("  反馈管理: /rclear 留历史 / /rl 翻页 / 群开关优先于配置 OK")
+
+
+def test_draws(main):
+    """/draw 参数、上限内外的状态流转、开奖对象、消息发送失败重试。"""
+    import asyncio
+
+    dr = sys.modules["zmplugin.core.draws"]
+    parse = dr.parse_draw_args
+
+    good, _ = parse(["周末", "3", "24", "FALSE", "100"])
+    assert good == {"name": "周末", "winner_count": 3, "hours": 24.0, "forced": False, "limit": 100}
+    assert parse(["周末", "3", "99999", "true"])[0]["limit"] == 0
+    capped = parse(["周末", "3", "24", "true", "2"])[0]
+    assert (capped["winner_count"], capped["limit"]) == (2, 0), "强制抽奖的人数上限压低中奖人数"
+    for bad in (
+        ["周末", "3", "24"],
+        ["周末", "3", "24", "true", "100", "多余"],
+        ["周末", "0", "24", "true"],
+        ["周末", "-1", "24", "true"],
+        ["周末", "3", "0", "true"],
+        ["周末", "3", "100000", "true"],
+        ["周末", "3", "9" * 400, "true"],
+        ["周末", "3", "nan", "true"],
+        ["周末", "3", "24", "yes"],
+        ["周末", "3", "24", "false", "0"],
+        ["周末", "3", "24", "true", "0"],
+        ["周末", "9" * 5000, "24", "true"],
+        ["名" * 31, "3", "24", "true"],
+    ):
+        assert parse(bad)[0] is None, bad
+
+    class FakeStore(dict):
+        def group(self, gid):
+            return self.setdefault(gid, {})
+
+        async def save(self):
+            pass
+
+    import time
+
+    run = asyncio.run
+    book = dr.DrawBook(FakeStore())
+    fields = lambda name, forced=False, limit=0, hours=1.0: {
+        "name": name, "winner_count": 2, "hours": hours, "forced": forced, "limit": limit
+    }
+
+    run(book.add("100", fields("A", limit=2)))
+    assert "已参与" in run(book.join("100", "A", "1"))
+    assert "您已参与" in run(book.join("100", "A", "1")), "重复报名不算两个名额"
+    assert "已参与" in run(book.join("100", "A", "2"))
+    assert "已满" in run(book.join("100", "A", "3"))
+    run(book.drop_member("100", "2"))
+    assert "已参与" in run(book.join("100", "A", "3")), "退群空出的名额能补"
+    assert book.get("100", "A")["participants"] == ["1", "3"]
+
+    missing = run(book.join("100", "不存在", "1"))
+    assert "没有这个抽奖" in missing and "不存在" not in missing
+
+    run(book.add("100", fields("B", forced=True)))
+    assert "无需报名" in run(book.join("100", "B", "1"))
+    assert book.get("100", "B")["participants"] == []
+
+    # 开奖对象：强制抽奖算当前全体（含后进群的），不含机器人；报名抽奖只算还在群里的
+    members = [{"user_id": uid} for uid in (1, 2, 8, 9)]
+    forced = {"forced": True, "winner_count": 99}
+    assert sorted(dr.pick_winners(forced, members, "8")) == ["1", "2", "9"]
+    joined = {"forced": False, "winner_count": 99, "participants": ["1", "7"]}
+    assert dr.pick_winners(joined, members, "8") == ["1"], "退群的 7 不算"
+    assert dr.pick_winners({"forced": False, "winner_count": 2}, members, "8") == []
+    assert len(dr.pick_winners({"forced": True, "winner_count": 2}, members, "8")) == 2
+    assert len(set(dr.pick_winners({"forced": True, "winner_count": 3}, members, "8"))) == 3
+
+    # 开奖消息：@ + QQ 号 + 领奖提示；抽奖名走文本段，不会被当成 CQ 码；人多分条
+    next_message = dr.next_message
+    message, chunk = next_message("[CQ:at,qq=all]", {"winners": ["1", "2"]}, "{name} 共 {count} 人")
+    assert chunk == ["1", "2"]
+    assert [seg["type"] for seg in message] == ["text", "at", "text", "at", "text", "text"]
+    assert message[1]["data"]["qq"] == "1" and "QQ:2" in message[4]["data"]["text"]
+    assert message[-1]["data"]["text"] == "[CQ:at,qq=all] 共 2 人"
+    message, chunk = next_message("X", {"winners": [str(i) for i in range(45)]}, "领奖")
+    assert len(chunk) == 20 and "共 45 人" in message[0]["data"]["text"]
+    assert "领奖" not in str(message), "领奖提示只在最后一条"
+    message, chunk = next_message("X", {"winners": ["44"], "announced": 44}, "{count}")
+    assert chunk == ["44"] and message[0]["type"] == "at" and message[-1]["data"]["text"] == "45"
+    message, chunk = next_message("X", {"winners": [], "announced": 20}, "领奖")
+    assert chunk == [] and message == [{"type": "text", "data": {"text": "领奖"}}], "只差提示"
+    assert "无人中奖" in next_message("X", {"winners": []}, "领奖")[0][0]["data"]["text"]
+
+    # 手改过的 draws.json：能兜住的兜住，兜不住的不能立刻开奖删记录
+    book.store["300"] = {
+        "数字": {"participants": [1, 2], "ends_at": 9 ** 20},
+        "空": {"participants": None, "ends_at": 9 ** 20},
+        "坏时间": {"ends_at": "2030-01-01", "participants": 5},
+        "无穷": {"ends_at": float("inf")},
+    }
+    assert "您已参与" in run(book.join("300", "数字", "1")), "数字 QQ 也要认"
+    assert "已参与" in run(book.join("300", "空", "1"))
+    assert all(item[0] != "300" for item in book.due(10 ** 10)), "时间坏了的不能算到点"
+    broken = dr.list_text(book, "300")
+    assert broken.count("时间异常") >= 2 and "坏时间" in broken and "无穷" in broken, broken
+    assert dr.pick_winners({"winner_count": -1, "participants": [1]}, members, "8") == ["1"]
+    bad_count = {"attempts": -100}
+    assert book.retry_later(bad_count, 0) and bad_count["attempts"] == 1
+    assert next_message("X", {"winners": [1], "announced": "坏"}, "t")[1] == ["1"]
+    del book.store["300"]
+
+    # 开奖流程：假的是协议端，OneBotApi 和开奖逻辑都是真的
+    class FakeClient:
+        def __init__(self, bot_id=8):
+            self.api = self
+            self.members, self.send_ok, self.sent, self.calls = members, True, [], []
+            self.bot_id, self.groups = bot_id, [{"group_id": 100}]
+            self.on_send = self.on_members = None
+            self.connected, self.need_route = True, False
+
+        async def call_action(self, action, **kw):
+            self.calls.append((action, kw))
+            if not self.connected or kw.get("self_id", self.bot_id) != self.bot_id:
+                raise RuntimeError("ApiNotAvailable")
+            if self.need_route and "self_id" not in kw:
+                raise RuntimeError("ApiNotAvailable")
+            if action == "get_login_info":
+                return {"user_id": self.bot_id}
+            if action == "get_group_list":
+                return self.groups
+            if action == "get_group_member_list":
+                assert kw.get("no_cache"), "开奖要求协议端刷新成员"
+                if self.on_members:
+                    await self.on_members(kw["group_id"])
+                return self.members
+            assert action == "send_group_msg", action
+            self.sent.append(kw["message"])
+            if self.on_send:
+                await self.on_send()
+            if not self.send_ok:
+                raise RuntimeError("发送失败")
+            return {"message_id": 1}
+
+    class FakeEvent:
+        message_obj = types.SimpleNamespace(raw_message={"sender": {"role": "owner"}})
+
+        def __init__(self, text, bot=None, admin=False, group="100"):
+            self.message_str, self.bot, self.admin, self.group = text, bot, admin, group
+
+        def get_group_id(self):
+            return self.group
+
+        def get_sender_id(self):
+            return "1"
+
+        def get_self_id(self):
+            return "8"
+
+        def get_platform_name(self):
+            return "aiocqhttp"
+
+        def is_admin(self):
+            return self.admin
+
+        def plain_result(self, text):
+            return text
+
+    async def collect(gen):
+        return [item async for item in gen]
+
+    api = FakeClient()
+    inst = object.__new__(main.ZMQQGroupmgr)
+    inst.config = {}
+    inst.draws_store = book.store
+    inst.draws = book
+    inst._announcing = None
+    inst._draw_offline = set()
+    inst._clients = lambda: [api]
+    settle = lambda: run(inst._settle_draws())
+    ripe = lambda name: book.get("100", name).update(ends_at=1, retry_at=0)
+    ats = lambda message: [seg["data"]["qq"] for seg in message if seg["type"] == "at"]
+    all_ats = lambda: [uid for message in api.sent for uid in ats(message)]
+    cancel = lambda name: collect(inst.cmd_draw_cancel(FakeEvent(f"/draw_cancel {name}")))
+    reset = api.__init__
+    tip_sent = lambda: dr.DEFAULT_CLAIM_TIP in str(api.sent[-1])
+
+    def prepared(name, winners):
+        """建一条到点的抽奖，名单已抽好。"""
+        run(book.add("100", fields(name, forced=True)))
+        ripe(name)
+        book.get("100", name)["winners"] = list(winners)
+
+    real_sleep = main.asyncio.sleep
+
+    async def no_sleep(_):
+        await real_sleep(0)
+
+    main.asyncio.sleep = no_sleep
+    try:
+        assert book.due(0) == [] and len(book.due(10 ** 12)) == 2
+        ripe("A")
+        settle()
+        assert book.get("100", "A") is None and book.get("100", "B") is not None, "没到点的不开"
+        assert ats(api.sent[0]) == ["1"], "A 只有 1 还在群里"
+
+        # 协议端没连好不算失败，机器人离线多久都等
+        reset()
+        ripe("B")
+        for broken in ("connected", "bot_id", "groups"):
+            setattr(api, broken, False if broken == "connected" else None)
+            settle()
+            reset()
+        assert api.sent == [] and "attempts" not in book.get("100", "B")
+
+        # 群列表是空的不等于没连好：机器人被踢出唯一的群，走重试，不会永远占着名额
+        api.groups = []
+        settle()
+        assert book.get("100", "B")["attempts"] == 1
+        reset()
+        ripe("B")
+        book.get("100", "B").pop("attempts")
+
+        # 成员列表查不到：不能当成没人参与把抽奖作废，也不能立刻再试
+        api.members = []
+        settle()
+        draw = book.get("100", "B")
+        assert api.sent == [] and draw["attempts"] == 1 and draw["retry_at"] > time.time()
+        assert book.due(time.time()) == []
+        settle()
+        assert draw["attempts"] == 1, "没到重试时间不该再试"
+
+        # 发送失败：留着重试，且下一轮还是同一批中奖者
+        reset()
+        ripe("B")
+        api.send_ok = False
+        settle()
+        first = list(book.get("100", "B")["winners"])
+        assert len(first) == 2 and len(api.sent) == 1
+        ripe("B")
+        api.members, api.send_ok = [{"user_id": 1}, {"user_id": 2}, {"user_id": 3}], True
+        settle()
+        assert book.get("100", "B") is None and ats(api.sent[-1]) == first
+
+        # 重试有上限：次数用完放弃，不会一直 @ 下去
+        reset()
+        run(book.add("100", fields("E", forced=True)))
+        api.send_ok = False
+        for _ in range(dr.MAX_ATTEMPTS):
+            ripe("E")
+            settle()
+        assert book.get("100", "E") is None and len(api.sent) == dr.MAX_ATTEMPTS
+
+        # 机器人不在群里：走同一套重试
+        reset()
+        run(book.add("100", fields("Z", forced=True)))
+        api.groups = [{"group_id": 999}]
+        for _ in range(dr.MAX_ATTEMPTS):
+            ripe("Z")
+            settle()
+        assert book.get("100", "Z") is None and api.sent == []
+
+        # 重试间隔翻倍，放弃时间和文档写的约 68 小时一致
+        run(book.add("100", fields("T")))
+        clock, schedule = book.get("100", "T"), [0]
+        while book.retry_later(clock, schedule[-1]):
+            schedule.append(clock["retry_at"])
+        assert len(schedule) == dr.MAX_ATTEMPTS and 67 * 3600 < schedule[-1] < 69 * 3600
+        run(book.remove("100", "T"))
+
+        # 分条发送中途失败：已发出的不重发，从失败那条续发
+        reset()
+        prepared("F", [str(i) for i in range(1000, 1045)])
+
+        async def fail_second():
+            api.send_ok = len(api.sent) != 2
+
+        api.on_send = fail_second
+        settle()
+        assert len(api.sent) == 2 and book.get("100", "F")["announced"] == 20
+        ripe("F")
+        settle()
+        assert len(api.sent) == 4 and api.sent[2] == api.sent[1] and book.get("100", "F") is None
+        assert len(ats(api.sent[0])) == 20 and len(ats(api.sent[3])) == 5 and tip_sent()
+
+        # 有进展就重新计数：人多到每轮只发出一条，也不能半路放弃
+        reset()
+        prepared("U", [str(i) for i in range(1000, 1300)])
+
+        async def fail_every_other():
+            api.send_ok = len(api.sent) % 2 == 1
+
+        api.on_send = fail_every_other
+        for _ in range(40):
+            if book.get("100", "U"):
+                ripe("U")
+                settle()
+        assert book.get("100", "U") is None and tip_sent()
+        assert len(set(all_ats())) == 300, "一个都不能漏"
+
+        # 公布途中退群：没通报到的人不再 @，其他人不漏不重，人数和提示都对
+        reset()
+        prepared("V", [str(i) for i in range(1000, 1045)])
+        api.on_send = fail_second
+        settle()
+        run(book.drop_member("100", "1025"))
+        ripe("V")
+        settle()
+        # api.sent[1] 是发送失败的那条，没有送达
+        seen = ats(api.sent[0]) + [uid for message in api.sent[2:] for uid in ats(message)]
+        assert "1025" not in seen and len(seen) == len(set(seen)) == 44
+        assert book.get("100", "V") is None and tip_sent()
+
+        # 还没通报的人全退了：只差领奖提示也要发
+        reset()
+        prepared("W", [str(i) for i in range(1000, 1021)])
+        api.on_send = fail_second
+        settle()
+        run(book.drop_member("100", "1020"))
+        ripe("W")
+        settle()
+        assert book.get("100", "W") is None and tip_sent() and ats(api.sent[-1]) == []
+
+        # 这条不带领奖提示，发送途中剩下的人退群：提示要单独补发
+        reset()
+        prepared("AG", [str(i) for i in range(1000, 1021)])
+
+        async def last_one_leaves():
+            await book.drop_member("100", "1020")
+
+        api.on_send = last_one_leaves
+        settle()
+        assert book.get("100", "AG") is None and len(api.sent) == 2 and tip_sent()
+        assert dr.DEFAULT_CLAIM_TIP not in str(api.sent[0])
+
+        # 发送途中退群且这条又失败：重试不再 @ 他
+        reset()
+        prepared("X", ["1", "2"])
+
+        async def leave_then_fail():
+            await book.drop_member("100", "1")
+            api.send_ok = False
+
+        api.on_send = leave_then_fail
+        settle()
+        api.on_send, api.send_ok = None, True
+        ripe("X")
+        settle()
+        assert ats(api.sent[-1]) == ["2"] and book.get("100", "X") is None
+
+        # 中奖者全退群而且什么都没公布过：重抽，不能公布无人中奖
+        reset()
+        prepared("Y", ["7"])
+        book.get("100", "Y").update(forced=False, winner_count=1, participants=["7", "1", "2"])
+        api.send_ok = False
+        settle()
+        api.send_ok = True
+        run(book.drop_member("100", "7"))
+        ripe("Y")
+        settle()
+        assert ats(api.sent[-1])[0] in ("1", "2") and book.get("100", "Y") is None
+        assert "无人中奖" not in str(api.sent)
+
+        # 落盘等待期间中奖者全退群：同样不能公布无人中奖
+        reset()
+        prepared("AF", ["7"])
+        book.get("100", "AF").update(forced=False, winner_count=1, participants=["7", "1"])
+
+        async def leave_during_save():
+            del book.store.save
+            await book.drop_member("100", "7")
+
+        book.store.save = leave_during_save
+        settle()
+        assert api.sent == [] and book.get("100", "AF")["attempts"] == 1
+        ripe("AF")
+        settle()
+        assert ats(api.sent[-1]) == ["1"] and book.get("100", "AF") is None
+
+        # 发送成功的途中退群：这条算发出去了，不能重抽
+        reset()
+        prepared("AA", ["7"])
+
+        async def leave_only():
+            await book.drop_member("100", "7")
+
+        api.on_send = leave_only
+        settle()
+        assert book.get("100", "AA") is None and len(api.sent) == 1
+
+        # 发送途中 /draw_cancel：不能回复已取消却照发，也不能把记录删掉
+        reset()
+        run(book.add("100", fields("G", forced=True)))
+        ripe("G")
+        replies = []
+
+        async def cancel_during_send():
+            replies.extend(await cancel("G"))
+
+        api.on_send = cancel_during_send
+        settle()
+        assert "无法取消" in replies[0] and len(api.sent) == 1 and book.get("100", "G") is None
+
+        # 已公布一部分、等待重试时也不能取消，否则剩下的中奖者没有说法
+        reset()
+        prepared("AB", [str(i) for i in range(1000, 1045)])
+        api.on_send = fail_second
+        settle()
+        assert "无法取消" in run(cancel("AB"))[0] and book.get("100", "AB") is not None
+        run(book.remove("100", "AB"))
+
+        # 查成员途中取消：不发
+        reset()
+        run(book.add("100", fields("H", forced=True)))
+        ripe("H")
+
+        async def cancel_during_query(_):
+            await cancel("H")
+
+        api.on_members = cancel_during_query
+        settle()
+        assert api.sent == [] and book.get("100", "H") is None
+
+        # 开上一条时取消下一条（名单已抽出、等重试的那种）：不发，同名重开的也不受影响
+        reset()
+        run(book.add("100", fields("I", forced=True)))
+        run(book.add("100", fields("J", forced=True)))
+        ripe("I"), ripe("J")
+        book.get("100", "J")["winners"] = ["1"]
+
+        async def recreate_next():
+            await cancel("J")
+            run_new.append(await book.add("100", fields("J", forced=True)))
+
+        run_new = []
+        api.on_send = recreate_next
+        settle()
+        assert len(api.sent) == 1, "被取消的 J 不能发"
+        assert book.get("100", "J") is run_new[0], "新开的同名抽奖不能被旧流程开掉"
+        run(book.remove("100", "J"))
+
+        # 什么都没发出去、等待重试时可以取消
+        reset()
+        run(book.add("100", fields("K", forced=True)))
+        ripe("K")
+        api.send_ok = False
+        settle()
+        assert "已取消" in run(cancel("K"))[0] and book.get("100", "K") is None
+
+        # 一条记录抛异常不能卡住别的群
+        reset()
+        run(book.add("100", fields("L", forced=True)))
+        run(book.add("300", fields("坏", forced=True)))
+        ripe("L")
+        book.get("300", "坏").update(ends_at=1)
+        api.groups = [{"group_id": 300}, {"group_id": 100}]
+
+        async def explode(group_id):
+            if group_id == 300:
+                raise RuntimeError("坏记录")
+
+        api.on_members = explode
+        settle()
+        assert book.get("100", "L") is None and len(api.sent) == 1
+        assert book.get("300", "坏")["attempts"] == 1
+        del book.store["300"]
+
+        # 多账号：由发起的账号开奖，适配器换顺序也一样，机器人自己不中奖
+        reset()
+        other = FakeClient(bot_id=9)
+        other.members = [{"user_id": 1}, {"user_id": 9}]
+        for order in ([api, other], [other, api]):
+            inst._clients = lambda order=order: order
+            run(book.add("100", fields("AC", forced=True), "9"))
+            ripe("AC")
+            settle()
+            assert book.get("100", "AC") is None and ats(other.sent[-1]) == ["1"] and api.sent == []
+        assert all(kw.get("self_id") == 9 for _, kw in other.calls), "每次调用都要指明账号"
+
+        # 同一适配器连多个账号：不指明账号就报错的那种
+        other.need_route = True
+        run(book.add("100", fields("AD", forced=True), "9"))
+        ripe("AD")
+        settle()
+        assert book.get("100", "AD") is None
+
+        # 发起的账号掉线：等它，不算失败，不换别的账号开，日志只提示一次
+        other.connected = False
+        run(book.add("100", fields("AE", forced=True), "9"))
+        ripe("AE")
+        settle(), settle()
+        assert "attempts" not in book.get("100", "AE") and inst._draw_offline == {"9"}
+        assert api.sent == []
+        other.connected = True
+        settle()
+        assert book.get("100", "AE") is None and inst._draw_offline == set()
+        inst._clients = lambda: [api]
+
+        # 手改坏的 self_id：不能抛异常卡住整轮开奖
+        reset()
+        for bad in ("²", "9" * 5000):
+            run(book.add("100", fields("AH", forced=True), bad))
+            ripe("AH")
+            settle()
+            assert book.get("100", "AH") is None and api.sent
+
+        # /draw 指令：记下发起账号，超长时间不报错，上限和重名都拦得住
+        draw_cmd = lambda text: run(collect(inst.cmd_draw(FakeEvent(text, api))))
+        assert "已开启" in draw_cmd("/draw N 1 99999 true")[0]
+        assert book.get("100", "N")["self_id"] == "8"
+        assert "已有名为" in draw_cmd("/draw N 1 1 true")[0]
+        for extra in "OPQR":
+            draw_cmd(f"/draw {extra} 1 1 true")
+        assert len(book.draws("100")) == 5
+        assert "已达上限" in draw_cmd("/draw S 1 1 true")[0] and book.get("100", "S") is None
+
+        # 上限按所有群合计：名额被别的群占着，本群一个没有也开不了；非群号的键不算
+        run(book.remove("100", "R"))
+        run(book.add("200", fields("别的群")))
+        book.store["__meta__"] = {"不是抽奖": {}}
+        assert book.total() == 5 and len(book.draws("100")) == 4
+        assert "已达上限" in draw_cmd("/draw S 1 1 true")[0] and book.get("100", "S") is None
+        run(book.remove("200", "别的群"))
+        del book.store["__meta__"]
+        assert "已开启" in draw_cmd("/draw S 1 1 true")[0], "名额空出来就能开"
+        for name in list(book.draws("100")):
+            run(book.remove("100", name))
+
+        # 名额被别的群占着：AstrBot 管理员能跨群查看和取消，私聊也行；群管理碰不到别的群
+        cancel_as = lambda text, **kw: run(collect(inst.cmd_draw_cancel(FakeEvent(text, **kw))))
+        run(book.add("200", fields("别群")))
+        assert "仅群聊" in cancel_as("/draw_cancel 200 别群", group="")[0], "私聊的普通人"
+        assert "没有名为" in cancel_as("/draw_cancel 200 别群")[0] and book.get("200", "别群")
+        listing = cancel_as("/draw_cancel", group="", admin=True)[0]
+        assert "群 200" in listing and "别群" in listing and "1/5" in listing, listing
+        assert "群号" in cancel_as("/draw_cancel 别群", group="", admin=True)[0], "私聊要写群号"
+        for text in ("/draw_cancel", "/draw_cancel 打错", "/draw_cancel 404 打错"):
+            reply = cancel_as(text, admin=True)[0]
+            assert "200" not in reply and "别群" not in reply, "群里不能露出别的群"
+        assert book.get("200", "别群") and "1/5" in dr.list_text(book, "100")
+        assert "已取消" in cancel_as("/draw_cancel 200 别群", group="", admin=True)[0]
+        assert book.get("200", "别群") is None
+        assert "0/5" in cancel_as("/draw_cancel", group="", admin=True)[0]
+
+        # 已公布一部分的：群管理不能取消，管理员能，正在发送时都不能
+        prepared("AI", ["1"])
+        draw = book.get("100", "AI")
+        draw["announced"] = 20
+        assert "无法取消" in cancel_as("/draw_cancel AI")[0]
+        inst._announcing = draw
+        assert "无法取消" in cancel_as("/draw_cancel AI", admin=True)[0]
+        inst._announcing = None
+        reply = cancel_as("/draw_cancel AI", admin=True)[0]
+        assert "已取消" in reply and "已公布 20 人" in reply and "未公布的 1 人" in reply, reply
+        assert book.get("100", "AI") is None
+    finally:
+        main.asyncio.sleep = real_sleep
+
+    run(book.add("200", fields("D", hours=0.01)))
+    text = dr.list_text(book, "200")
+    assert "D" in text and "所有群合计 1/5" in text and "已参与 0 人" in text
+    assert dr.list_text(book, "404") == "本群当前没有进行中的抽奖（所有群合计 1/5）"
+    print("  抽奖: 参数 / 报名 / 退群 / 开奖对象 / 重试上限 / 续发 / 取消竞态 / 坏记录隔离 / 多账号 OK")
+
+
+def test_store_recovery():
+    """读不出来的文件不能被下一次保存覆盖；写不进 UTF-8 的字符不能让保存一直失败。"""
+    import asyncio
+
+    st = sys.modules["zmplugin.core.store"]
+    root = Path(tempfile.mkdtemp())
+
+    def open_store(name):
+        store = object.__new__(st.JsonStore)
+        store.path, store._data, store._lock = root / name, {}, asyncio.Lock()
+        store._load()
+        return store
+
+    for name, text in (("bad.json", '{"a": 1,}'), ("list.json", "[1, 2]")):
+        (root / name).write_text(text, encoding="utf-8")
+        store = open_store(name)
+        assert store.data == {}
+        asyncio.run(store.save())
+        kept = list(root.glob(name + ".corrupt-*"))
+        assert len(kept) == 1 and kept[0].read_text(encoding="utf-8") == text, name
+    assert open_store("missing.json").data == {} and not list(root.glob("missing*"))
+
+    # 原文件挪不走：本次运行不能写盘，否则就把它覆盖了
+    (root / "locked.json").write_text("{坏", encoding="utf-8")
+    real_replace = st.os.replace
+
+    def deny(*_):
+        raise PermissionError("文件被占用")
+
+    st.os.replace = deny
+    try:
+        store = open_store("locked.json")
+    finally:
+        st.os.replace = real_replace
+    store.set("a", 1)
+    asyncio.run(store.save())
+    assert (root / "locked.json").read_text(encoding="utf-8") == "{坏"
+
+    store = open_store("surrogate.json")
+    store.set("a", "x\ud83dy")
+    asyncio.run(store.save())
+    assert open_store("surrogate.json").get("a") == "x?y"
+    assert st.coerce_int(float("inf"), 7) == 7
+    print("  数据文件: 损坏保留原文件 / 孤立代理字符可写 OK")
+
+
 if __name__ == "__main__":
     _stub_astrbot()
     main = _load_plugin()
@@ -542,4 +1210,7 @@ if __name__ == "__main__":
     test_long_mute()
     test_reports()
     test_report_handlers(main)
+    test_report_admin(main)
+    test_draws(main)
+    test_store_recovery()
     print(f"全部自检通过 —— {main.PLUGIN_NAME} v{main.PLUGIN_VERSION}")
